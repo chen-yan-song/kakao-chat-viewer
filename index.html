@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KakaoChat Viewer — 浏览器端聊天记录查看器</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%23FEE500'/><text x='50' y='66' font-size='52' text-anchor='middle'>💬</text></svg>" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-ball">💬</span>
+        <div>
+          <h1>KakaoChat Viewer</h1>
+          <p>纯浏览器端 KakaoTalk 聊天记录查看器 · SQLCipher WASM 解密</p>
+        </div>
+      </div>
+      <span class="privacy-badge" title="所有解密与解析均在本机浏览器内存中完成，数据不会上传">
+        <span class="dot"></span> 100% 本地处理
+      </span>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- ============ 配置阶段 ============ -->
+    <section id="setup">
+      <div class="card intro-card">
+        <h2>三步打开你的 KakaoTalk 聊天记录</h2>
+        <ol class="steps">
+          <li><b>设备 UUID</b> — 填写这台 Mac 的硬件 UUID（用于密钥派生）</li>
+          <li><b>用户 ID</b> — 上传偏好设置 plist 自动提取，或手动填写</li>
+          <li><b>数据库文件</b> — 选择 KakaoTalk 本地加密数据库，一键解密</li>
+        </ol>
+      </div>
+
+      <div class="grid2">
+        <!-- 第 1 步：UUID -->
+        <div class="card">
+          <h3><span class="step-num">1</span> 设备 UUID</h3>
+          <label class="field-label" for="uuidInput">Mac 硬件 UUID（IOPlatformUUID）</label>
+          <input id="uuidInput" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="例如 A1B2C3D4-5E6F-7890-AB12-CD34567890EF" />
+          <details class="hint-details">
+            <summary>如何获取 UUID？</summary>
+            <div class="hint-body">
+              在「终端」中运行以下命令，复制输出结果：
+              <pre>ioreg -d2 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/{print $(NF-1)}'</pre>
+              该 UUID 仅用于本地密钥派生（与 kakaocli 相同算法），不会上传。
+            </div>
+          </details>
+        </div>
+
+        <!-- 第 2 步：userId -->
+        <div class="card">
+          <h3><span class="step-num">2</span> 用户 ID</h3>
+          <label class="field-label">方式一：上传偏好设置自动提取（推荐）</label>
+          <div id="plistDrop" class="dropzone">
+            <input id="plistFile" type="file" accept=".plist" hidden />
+            <span class="dz-icon">📄</span>
+            <span>拖入或点击选择 <b>com.kakao.KakaoTalkMac.plist</b></span>
+            <span class="dz-path">路径：~/Library/Containers/com.kakao.KakaoTalkMac/Data/Library/Preferences/</span>
+          </div>
+          <div id="plistResult" class="plist-result" hidden></div>
+
+          <div id="brutePanel" class="brute-panel" hidden>
+            <div class="brute-title">⚠️ plist 中只找到 userId 的 SHA-512 哈希，需要爆破还原</div>
+            <div class="brute-range">
+              搜索范围：
+              <input id="bruteStart" type="number" value="0" min="0" />
+              ~
+              <input id="bruteEnd" type="number" value="100000000" min="1" />
+            </div>
+            <div class="brute-actions">
+              <button id="bruteBtn" class="btn btn-yellow">开始爆破</button>
+              <button id="bruteAbortBtn" class="btn btn-plain" hidden>停止</button>
+            </div>
+            <div class="progress" hidden id="bruteProgress"><div class="progress-bar"></div></div>
+            <p id="bruteStatus" class="brute-status"></p>
+          </div>
+
+          <div id="candidatePanel" class="candidate-panel" hidden>
+            <label class="field-label">检测到多个候选账号，请选择：</label>
+            <select id="candidateSelect"></select>
+          </div>
+
+          <label class="field-label" for="userIdInput">方式二：手动填写 KakaoTalk 用户 ID</label>
+          <input id="userIdInput" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="纯数字用户 ID，例如 123456789" />
+        </div>
+      </div>
+
+      <!-- 第 3 步：数据库 -->
+      <div class="card">
+        <h3><span class="step-num">3</span> 选择数据库文件并解密</h3>
+        <div id="dbDrop" class="dropzone wide">
+          <input id="dbFile" type="file" multiple hidden />
+          <span class="dz-icon">🔐</span>
+          <span>拖入或点击选择加密数据库文件（长十六进制文件名）</span>
+          <span class="dz-path">路径：~/Library/Containers/com.kakao.KakaoTalkMac/Data/Library/Application Support/com.kakao.KakaoTalkMac/</span>
+          <span class="dz-hint">只选主库即可；若目录中存在同名 -wal / -shm 文件（仅 KakaoTalk 运行期间存在，可选）可按住 ⌘ 一并选中</span>
+        </div>
+        <ul id="dbList" class="file-list" hidden></ul>
+
+        <div class="open-row">
+          <button id="openBtn" class="btn btn-yellow btn-lg" disabled>解密并加载聊天记录</button>
+          <span id="openHint" class="open-hint">请先填写 UUID 与用户 ID，并选择数据库文件</span>
+        </div>
+        <div id="progressArea" class="progress-area" hidden>
+          <p id="progressText">准备中…</p>
+          <div class="progress" id="progressBarWrap"><div class="progress-bar" id="progressBar"></div></div>
+        </div>
+        <p id="errorMsg" class="error-msg" hidden></p>
+      </div>
+    </section>
+
+    <!-- ============ 查看阶段 ============ -->
+    <section id="viewer" hidden>
+      <div class="viewer-wrap">
+        <aside class="sidebar">
+          <div class="search-box">
+            <input id="chatSearch" type="text" placeholder="搜索消息内容（回车）" spellcheck="false" />
+            <button id="searchBtn" title="搜索">🔍</button>
+          </div>
+          <div id="statsBar" class="stats-bar"></div>
+          <ul id="chatList" class="chat-list"></ul>
+        </aside>
+
+        <div class="chat-pane">
+          <div class="chat-header">
+            <div>
+              <h3 id="chatTitle">选择一个聊天室</h3>
+              <p id="chatMeta"></p>
+            </div>
+            <button id="exportBtn" class="btn btn-plain" hidden>导出 JSON</button>
+          </div>
+          <div id="msgList" class="msg-list">
+            <div id="msgEmpty" class="msg-empty">👈 从左侧选择一个聊天室开始查看</div>
+          </div>
+          <button id="loadMoreBtn" class="btn btn-plain load-more" hidden>加载更早的消息 ↑</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>
+      本工具基于 <a href="https://github.com/silver-flight-group/kakaocli" target="_blank" rel="noopener">kakaocli</a>
+      的密钥派生算法，使用 <a href="https://github.com/7mind/sqlcipher-wasm" target="_blank" rel="noopener">SQLCipher WASM</a> 在浏览器内解密。
+      所有数据仅存于本机内存，关闭页面即销毁，不会上传任何内容。
+    </p>
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
