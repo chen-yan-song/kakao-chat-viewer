@@ -48,8 +48,14 @@ function queryRaw(module, dbPtr, sql, params = []) {
         if (p === null || p === undefined) {
           module._sqlite3_bind_null(stmt, idx);
         } else if (typeof p === 'number') {
-          if (Number.isInteger(p)) module._sqlite3_bind_int64(stmt, idx, p);
-          else module._sqlite3_bind_double(stmt, idx, p);
+          if (Number.isInteger(p)) {
+            // WASM_BIGINT 构建：int64 参数必须是 BigInt
+            module._sqlite3_bind_int64(stmt, idx, BigInt(p));
+          } else {
+            module._sqlite3_bind_double(stmt, idx, p);
+          }
+        } else if (typeof p === 'bigint') {
+          module._sqlite3_bind_int64(stmt, idx, p);
         } else if (typeof p === 'string') {
           const pPtr = module.allocateUTF8(p);
           // SQLITE_TRANSIENT = -1，让 SQLite 自行拷贝
@@ -91,7 +97,22 @@ function queryRaw(module, dbPtr, sql, params = []) {
           } else if (type === 4 /* BLOB */) {
             const bytes = module._sqlite3_column_bytes(stmt, i);
             const ptr = module._sqlite3_column_blob(stmt, i);
-            row[columns[i]] = module.HEAPU8.slice(ptr, ptr + bytes);
+            // 该 WASM 构建未导出 HEAPU8，需经 getValue 读取内存
+            // 用 i32 批量读（快 4 倍），剩余尾部逐字节读
+            const buf = new Uint8Array(bytes);
+            const words = bytes >>> 2;
+            let j = 0;
+            for (let w = 0; w < words; w++) {
+              const v = module.getValue(ptr + (w << 2), 'i32') >>> 0;
+              buf[j++] = v & 0xff;
+              buf[j++] = (v >>> 8) & 0xff;
+              buf[j++] = (v >>> 16) & 0xff;
+              buf[j++] = (v >>> 24) & 0xff;
+            }
+            for (; j < bytes; j++) {
+              buf[j] = module.getValue(ptr + j, 'i8') & 0xff;
+            }
+            row[columns[i]] = buf;
           } else {
             const ptr = module._sqlite3_column_text(stmt, i);
             row[columns[i]] = ptr ? module.UTF8ToString(ptr) : '';
@@ -306,6 +327,7 @@ export class KakaoDB {
              ${fields.authorId} AS authorId,
              ${uName} AS senderName,
              m.message AS message,
+             m.attachment AS attachment,
              ${fields.type} AS type,
              ${fields.sentAt} AS sentAt
       FROM NTChatMessage m
@@ -322,6 +344,7 @@ export class KakaoDB {
       authorId: r.authorId == null ? null : Number(r.authorId),
       senderName: r.senderName || null,
       message: r.message, // string 或 Uint8Array
+      attachment: r.attachment || null, // 贴纸/附件等非文本类型的 JSON 描述
       type: r.type == null ? 0 : Number(r.type),
       sentAt: r.sentAt == null ? null : Number(r.sentAt),
     }));
@@ -366,6 +389,7 @@ export class KakaoDB {
              ${fields.authorId} AS authorId,
              ${uName} AS senderName,
              m.message AS message,
+             m.attachment AS attachment,
              ${fields.type} AS type,
              ${fields.sentAt} AS sentAt
       FROM NTChatMessage m
@@ -383,6 +407,7 @@ export class KakaoDB {
       authorId: r.authorId == null ? null : Number(r.authorId),
       senderName: r.senderName || null,
       message: r.message,
+      attachment: r.attachment || null, // 贴纸/附件等非文本类型的 JSON 描述
       type: r.type == null ? 0 : Number(r.type),
       sentAt: r.sentAt == null ? null : Number(r.sentAt),
     }));
@@ -414,6 +439,36 @@ export class KakaoDB {
     try {
       out.userCount = Number(this.raw('SELECT count(*) AS c FROM NTUser').rows[0].c);
     } catch { out.userCount = null; }
+    return out;
+  }
+
+  /**
+   * 诊断扫描：列出所有表及行数（用于排查「解密成功但查不到数据」）
+   * @returns {{pageSize: number|null, pageCount: number|null, tables: Array<{name:string, count:number|null}>}}
+   */
+  diagnose() {
+    this._ensureOpen();
+    const out = { pageSize: null, pageCount: null, tables: [] };
+    try {
+      const pr = this.raw('PRAGMA page_size');
+      // SQLCipher 构建中该 PRAGMA 返回列名为 cipher_page_size，需兼容两种列名
+      const r = pr.rows.length ? pr.rows[0] : {};
+      out.pageSize = Number(r.page_size ?? r.cipher_page_size) || null;
+    } catch { /* 忽略 */ }
+    try {
+      const pc = this.raw('PRAGMA page_count');
+      out.pageCount = pc.rows.length ? Number(pc.rows[0].page_count) : null;
+    } catch { /* 忽略 */ }
+    const res = this.raw("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+    for (const { name } of res.rows) {
+      let count = null;
+      try {
+        const q = `SELECT count(*) AS c FROM "${String(name).replace(/"/g, '""')}"`;
+        count = Number(this.raw(q).rows[0].c);
+      } catch { count = null; }
+      out.tables.push({ name, count });
+    }
+    out.tables.sort((a, b) => (b.count ?? -1) - (a.count ?? -1));
     return out;
   }
 

@@ -7,7 +7,7 @@
  * 2. 二进制 → 提取其中可读的 UTF-8 文本片段（尽力而为）
  */
 
-/** 消息类型映射（与 kakaocli Message.swift 一致） */
+/** 消息类型映射（与 kakaocli Message.swift 一致，另补充 NT 架构新类型） */
 export const MESSAGE_TYPES = {
   0: { label: '系统', emoji: '⚙' },
   1: { label: '文本', emoji: '💬' },
@@ -17,6 +17,8 @@ export const MESSAGE_TYPES = {
   5: { label: '表情', emoji: '😀' },
   6: { label: '文件', emoji: '📎' },
   7: { label: '位置', emoji: '📍' },
+  20: { label: '表情贴纸', emoji: '🎴' },   // 动态贴纸，内容在 attachment JSON
+  1999: { label: '系统记录', emoji: '⚙' }, // 无内容系统占位消息（如已读边界）
 };
 
 export function messageTypeInfo(type) {
@@ -101,11 +103,17 @@ const JSON_TEXT_FIELDS = ['text', 'message', 'content', 'msg', 'body'];
  * 解析消息原始内容，返回展示信息
  * @param {string|Uint8Array|null} raw NTChatMessage.message 原始值
  * @param {number} type 消息类型
- * @returns {{text: string, kind: 'text'|'json'|'binary'|'empty'|'nontext', detail: string|null}}
+ * @param {string|null} attachment NTChatMessage.attachment（贴纸/附件等 JSON 描述）
+ * @returns {{text: string, kind: 'text'|'json'|'binary'|'empty'|'nontext'|'attachment', detail: string|null}}
  */
-export function parseMessage(raw, type) {
-  // 空值
-  if (raw === null || raw === undefined) {
+export function parseMessage(raw, type, attachment = null) {
+  // message 为空但有 attachment（贴纸/图片等）：从 attachment JSON 提取描述
+  const hasAttachment = typeof attachment === 'string' && attachment.trim().length > 0;
+  if (raw === null || raw === undefined || raw === '') {
+    if (hasAttachment) {
+      const att = tryParseAttachment(attachment, type);
+      if (att !== null) return att;
+    }
     return { text: '', kind: 'empty', detail: null };
   }
 
@@ -138,6 +146,30 @@ export function parseMessage(raw, type) {
   return { text: s, kind: 'text', detail: null };
 }
 
+/**
+ * 解析 attachment JSON（贴纸、图片、文件等非文本消息的描述）
+ * 例如：{"path":"4449277.emot_002.webp","alt":"카카오 이모티콘","name":"(이모티콘)",
+ *       "type":"animated-sticker/digital-item","width":"360","height":"360"}
+ */
+function tryParseAttachment(attachment, type) {
+  try {
+    const obj = JSON.parse(attachment);
+    if (obj === null || typeof obj !== 'object') return null;
+    // 优先取 alt（无障碍描述，如「카카오 이모티콘」）
+    const alt = typeof obj.alt === 'string' && obj.alt.trim() ? obj.alt.trim() : null;
+    const name = typeof obj.name === 'string' && obj.name.trim() ? obj.name.trim() : null;
+    const path = typeof obj.path === 'string' && obj.path.trim() ? obj.path.trim() : null;
+    const parts = [alt, name && name !== alt ? name : null].filter(Boolean);
+    return {
+      text: parts.length ? parts.join(' ') : (alt || name || path || ''),
+      kind: 'attachment',
+      detail: path || (parts.length ? null : JSON.stringify(obj)),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** 尝试把字符串当 JSON 解析并提取文本；失败返回 null */
 function tryParseJsonText(s) {
   const t = s.trim();
@@ -161,7 +193,11 @@ function tryParseJsonText(s) {
 /** 将消息解析结果渲染为聊天框展示文本 */
 export function renderMessageText(parsed, type) {
   const info = messageTypeInfo(type);
-  if (parsed.text) return parsed.text;
+  if (parsed.text) {
+    // 贴纸类：正文带描述时加类型前缀，一眼区分贴纸与普通文本
+    if (type === 20 && parsed.kind === 'attachment') return `[${info.label}] ${parsed.text}`;
+    return parsed.text;
+  }
   if (type === 1) return parsed.kind === 'empty' ? '' : '[不可读内容]';
   return `[${info.label}]`;
 }
@@ -178,7 +214,7 @@ export function serializeExport(chat, messages) {
         logId: m.logId,
         authorId: m.authorId,
         senderName: m.senderName,
-        text: parseMessage(m.message, m.type).text,
+        text: parseMessage(m.message, m.type, m.attachment).text,
         type: m.type,
         sentAt: m.sentAt,
         sentAtISO: m.sentAt ? new Date(m.sentAt * 1000).toISOString() : null,

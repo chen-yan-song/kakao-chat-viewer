@@ -5,7 +5,7 @@
  * 所有处理均在浏览器本地内存完成。
  */
 import { KakaoDB } from './kakaoDb.js';
-import { deriveSecureKey, isValidUUID } from './keyDerivation.js';
+import { deriveSecureKey, deriveDatabaseName, isValidUUID } from './keyDerivation.js';
 import {
   parseMessage,
   renderMessageText,
@@ -47,6 +47,10 @@ const el = {
   errorMsg: $('errorMsg'),
   setup: $('setup'),
   viewer: $('viewer'),
+  diagnosePanel: $('diagnosePanel'),
+  diagnoseSummary: $('diagnoseSummary'),
+  diagnoseBody: $('diagnoseBody'),
+  diagnoseClose: $('diagnoseClose'),
   chatSearch: $('chatSearch'),
   searchBtn: $('searchBtn'),
   statsBar: $('statsBar'),
@@ -67,6 +71,7 @@ const state = {
   bruteAborted: false,
   mainCandidates: [],    // 用户选中的主库候选文件
   mainFile: null,        // 当前选中的主库
+  mainMatchedByName: false, // 主库是否通过派生文件名精确匹配
   sideFiles: [],         // -wal/-shm 伴随文件
   db: null,              // KakaoDB 实例
   chats: [],             // 聊天室列表
@@ -317,7 +322,7 @@ function setupDbDrop() {
 
 const SIDE_SUFFIXES = ['-wal', '-shm', '-journal'];
 
-function handleDbFiles(files) {
+async function handleDbFiles(files) {
   clearError();
   const sides = [];
   const mains = [];
@@ -333,8 +338,29 @@ function handleDbFiles(files) {
   state.mainCandidates = mains.sort((a, b) => b.size - a.size);
   state.mainFile = state.mainCandidates[0];
   state.sideFiles = sides;
+  await matchMainByDerivedName();
   renderDbList();
   refreshOpenBtn();
+}
+
+/**
+ * 用密钥派生出的数据库文件名精确匹配真正的主库。
+ * 同目录可能残留其他账号的库文件（按大小排序可能把旧库误选为主库），
+ * 文件名 = PBKDF2 派生 hex 的第 28..106 位，可与候选文件名精确比对。
+ */
+async function matchMainByDerivedName() {
+  if (state.mainCandidates.length < 2) return;
+  const uuid = el.uuidInput.value.trim();
+  const userId = validUserId();
+  if (!isValidUUID(uuid) || userId === null) return;
+  try {
+    const expectName = await deriveDatabaseName(userId, uuid);
+    const hit = state.mainCandidates.find((f) => f.name.startsWith(expectName));
+    if (hit && hit !== state.mainFile) {
+      state.mainFile = hit;
+      state.mainMatchedByName = true;
+    }
+  } catch { /* 派生失败时保持按大小选择 */ }
 }
 
 function renderDbList() {
@@ -381,6 +407,10 @@ async function openDatabase() {
   const uuid = el.uuidInput.value.trim();
   const userId = validUserId();
   if (!isValidUUID(uuid) || userId === null || !state.mainFile) return;
+
+  // 解密前再按派生文件名校验一次主库选择，避免误选同目录的旧库
+  await matchMainByDerivedName();
+  renderDbList();
 
   state.uuid = uuid;
   state.userId = userId;
@@ -435,14 +465,87 @@ async function enterViewer() {
   if (stats.userCount != null) parts.push(`${stats.userCount} 位用户`);
   el.statsBar.textContent = parts.join(' · ') + ` · 当前账号 ID ${state.myId ?? '未知'}`;
 
+  // 先自动诊断（表结构异常时列表加载可能报错，诊断需在之前执行）
+  runDiagnose(db, stats);
+
   // 加载聊天室列表
-  state.chats = db.listChats(500);
+  try {
+    state.chats = db.listChats(500);
+  } catch (e) {
+    console.error('加载聊天室列表失败:', e);
+    state.chats = [];
+  }
   state.chatMap = new Map(state.chats.map((c) => [c.chatId, c]));
   renderChatList();
 
   if (state.chats.length > 0) {
     openChat(state.chats[0]);
   }
+}
+
+/**
+ * 自动诊断：扫描全部表，检测「解密成功但查不到聊天记录」的原因
+ */
+function runDiagnose(db, stats) {
+  let diag;
+  try {
+    diag = db.diagnose();
+  } catch (e) {
+    console.error('诊断扫描失败:', e);
+    return;
+  }
+  const tables = diag.tables;
+  const byName = (n) => tables.find((t) => t.name === n);
+  const room = byName('NTChatRoom');
+  const msg = byName('NTChatMessage');
+  const fileSize = state.mainFile
+    ? (state.mainFile.size / 1024 / 1024).toFixed(2) + ' MB'
+    : '未知';
+
+  const problems = [];
+  if (!room || !msg) {
+    problems.push('未找到 NTChatRoom / NTChatMessage 表——KakaoTalk 版本的表结构可能不同');
+  } else {
+    if (room.count === 0 && msg.count === 0) {
+      problems.push('NTChatRoom 与 NTChatMessage 表都是空的——此数据库没有聊天数据');
+    }
+  }
+  if (room && room.count === 0 && msg && msg.count > 0) {
+    problems.push('消息表有数据但聊天室表为空——表结构不一致');
+  }
+  if ((msg && msg.count === 0) || !msg) {
+    const hasSide = state.sideFiles.length > 0;
+    problems.push(
+      '未读到消息数据：若 KakaoTalk 正在运行，最新聊天记录可能仍在 -wal 文件中未合并' +
+        (hasSide ? '（本次已选伴随文件）' : '——建议退出 KakaoTalk 后重新选择主库，或连同 -wal 文件一起选择')
+    );
+  }
+
+  // 无异常时不打扰（保留手动查看能力）
+  if (problems.length === 0) {
+    el.diagnosePanel.hidden = true;
+    return;
+  }
+
+  el.diagnoseSummary.textContent =
+    `主库文件 ${fileSize} · page_size=${diag.pageSize ?? '?'} · page_count=${diag.pageCount ?? '?'} · ` +
+    `共 ${tables.length} 张表。` +
+    problems.join('；') + '。';
+
+  el.diagnoseBody.textContent = '';
+  const frag = document.createDocumentFragment();
+  for (const t of tables.slice(0, 40)) {
+    const tr = document.createElement('tr');
+    const tdName = document.createElement('td');
+    tdName.textContent = t.name;
+    const tdCount = document.createElement('td');
+    tdCount.textContent = t.count == null ? '读取失败' : t.count.toLocaleString();
+    tdCount.className = 'diag-count';
+    tr.append(tdName, tdCount);
+    frag.appendChild(tr);
+  }
+  el.diagnoseBody.appendChild(frag);
+  el.diagnosePanel.hidden = false;
 }
 
 // ============ 聊天室列表 ============
@@ -601,7 +704,7 @@ function renderMessages({ scrollBottom = false, keepScroll = false } = {}) {
     }
 
     const row = document.createElement('div');
-    const parsed = parseMessage(m.message, m.type);
+    const parsed = parseMessage(m.message, m.type, m.attachment);
     const mine = state.myId !== null && m.authorId === state.myId;
 
     if (m.type === 0) {
@@ -625,13 +728,19 @@ function renderMessages({ scrollBottom = false, keepScroll = false } = {}) {
       bubble.className = 'msg-bubble';
       bubble.textContent = renderMessageText(parsed, m.type);
 
-      // 结构化 JSON / 二进制摘要
+      // 结构化 JSON / 二进制 / 附件摘要
       if (parsed.kind === 'json' && parsed.detail && !parsed.text) {
         const detail = document.createElement('div');
         detail.className = 'msg-detail';
         detail.textContent = parsed.detail;
         bubble.appendChild(detail);
       } else if (parsed.kind === 'nontext' && parsed.detail) {
+        const detail = document.createElement('div');
+        detail.className = 'msg-detail';
+        detail.textContent = parsed.detail;
+        bubble.appendChild(detail);
+      } else if (parsed.kind === 'attachment' && parsed.detail) {
+        // 贴纸/附件文件名（如 4449277.emot_002.webp）
         const detail = document.createElement('div');
         detail.className = 'msg-detail';
         detail.textContent = parsed.detail;
@@ -717,7 +826,7 @@ async function doSearch() {
 
       const bubble = document.createElement('div');
       bubble.className = 'msg-bubble';
-      const parsed = parseMessage(m.message, m.type);
+      const parsed = parseMessage(m.message, m.type, m.attachment);
       bubble.textContent = renderMessageText(parsed, m.type) || messageTypeInfo(m.type).label;
       row.appendChild(bubble);
 
@@ -771,6 +880,9 @@ function bindEvents() {
   el.uuidInput.addEventListener('input', refreshOpenBtn);
   el.userIdInput.addEventListener('input', refreshOpenBtn);
   el.openBtn.addEventListener('click', openDatabase);
+  el.diagnoseClose.addEventListener('click', () => {
+    el.diagnosePanel.hidden = true;
+  });
   el.loadMoreBtn.addEventListener('click', loadMore);
   el.exportBtn.addEventListener('click', exportChat);
   el.searchBtn.addEventListener('click', doSearch);

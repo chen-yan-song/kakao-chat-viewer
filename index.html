@@ -117,6 +117,20 @@
 
     <!-- ============ 查看阶段 ============ -->
     <section id="viewer" hidden>
+      <div id="diagnosePanel" class="diagnose-panel" hidden>
+        <div class="diagnose-head">
+          <h3>🔍 数据库诊断</h3>
+          <button id="diagnoseClose" class="btn btn-plain" title="收起">✕</button>
+        </div>
+        <p id="diagnoseSummary" class="diagnose-summary"></p>
+        <div class="diagnose-table-wrap">
+          <table class="diagnose-table">
+            <thead><tr><th>表名</th><th>行数</th></tr></thead>
+            <tbody id="diagnoseBody"></tbody>
+          </table>
+        </div>
+        <p class="diagnose-tip">如查不到聊天记录，请将以上信息截图或复制，用于排查原因。</p>
+      </div>
       <div class="viewer-wrap">
         <aside class="sidebar">
           <div class="search-box">
