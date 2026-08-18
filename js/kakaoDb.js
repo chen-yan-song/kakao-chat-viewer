@@ -326,6 +326,7 @@ export class KakaoDB {
              ${fields.chatId} AS chatId,
              ${fields.authorId} AS authorId,
              ${uName} AS senderName,
+             u.accountId AS senderAccountId,
              m.message AS message,
              m.attachment AS attachment,
              ${fields.type} AS type,
@@ -343,6 +344,7 @@ export class KakaoDB {
       chatId: Number(r.chatId),
       authorId: r.authorId == null ? null : Number(r.authorId),
       senderName: r.senderName || null,
+      senderAccountId: r.senderAccountId == null ? null : Number(r.senderAccountId),
       message: r.message, // string 或 Uint8Array
       attachment: r.attachment || null, // 贴纸/附件等非文本类型的 JSON 描述
       type: r.type == null ? 0 : Number(r.type),
@@ -388,6 +390,7 @@ export class KakaoDB {
              ${fields.chatId} AS chatId,
              ${fields.authorId} AS authorId,
              ${uName} AS senderName,
+             u.accountId AS senderAccountId,
              m.message AS message,
              m.attachment AS attachment,
              ${fields.type} AS type,
@@ -406,6 +409,7 @@ export class KakaoDB {
       chatId: Number(r.chatId),
       authorId: r.authorId == null ? null : Number(r.authorId),
       senderName: r.senderName || null,
+      senderAccountId: r.senderAccountId == null ? null : Number(r.senderAccountId),
       message: r.message,
       attachment: r.attachment || null, // 贴纸/附件等非文本类型的 JSON 描述
       type: r.type == null ? 0 : Number(r.type),

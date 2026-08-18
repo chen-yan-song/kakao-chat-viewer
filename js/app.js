@@ -716,11 +716,17 @@ function renderMessages({ scrollBottom = false, keepScroll = false } = {}) {
     } else {
       row.className = 'msg-row ' + (mine ? 'mine' : 'other');
 
-      // 群聊中显示发送者昵称
-      if (!mine && isGroup) {
+      // 发送者信息行：昵称 + 用户 ID + 账号 ID（自己标记「我」）
+      {
         const sender = document.createElement('div');
         sender.className = 'msg-sender';
-        sender.textContent = m.senderName || (m.authorId != null ? String(m.authorId) : '未知');
+        const parts = [];
+        const isSystem = m.authorId === 0;
+        const name = m.senderName || (m.authorId != null ? String(m.authorId) : '未知');
+        parts.push(isSystem ? '系统' : (mine ? name + '（我）' : name));
+        if (m.authorId != null && !isSystem) parts.push('ID ' + m.authorId);
+        if (m.senderAccountId) parts.push('账号ID ' + m.senderAccountId);
+        sender.textContent = parts.join(' · ');
         row.appendChild(sender);
       }
 
@@ -821,7 +827,14 @@ async function doSearch() {
       const sender = document.createElement('div');
       sender.className = 'msg-sender';
       const roomName = state.chatMap.get(m.chatId)?.chatName || `聊天室 ${m.chatId}`;
-      sender.textContent = `${m.senderName || m.authorId || '未知'} · ${roomName}`;
+      const isSystem = m.authorId === 0;
+      const parts = [
+        isSystem ? '系统' : (m.senderName || (m.authorId != null ? String(m.authorId) : '未知')),
+        m.authorId != null && !isSystem ? `ID ${m.authorId}` : null,
+        m.senderAccountId ? `账号ID ${m.senderAccountId}` : null,
+        roomName,
+      ].filter(Boolean);
+      sender.textContent = parts.join(' · ');
       row.appendChild(sender);
 
       const bubble = document.createElement('div');

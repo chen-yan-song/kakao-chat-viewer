@@ -214,6 +214,7 @@ export function serializeExport(chat, messages) {
         logId: m.logId,
         authorId: m.authorId,
         senderName: m.senderName,
+        senderAccountId: m.senderAccountId ?? null,
         text: parseMessage(m.message, m.type, m.attachment).text,
         type: m.type,
         sentAt: m.sentAt,
