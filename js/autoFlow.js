@@ -160,10 +160,11 @@ async function runAutoFlowWindows() {
     return false;
   }
   if (!disc.devOk) {
-    setStep('uuid', 'fail', '注册表中未找到设备材料（dev_id）——请确认已在本机登录过 KakaoTalk PC 版');
-    return false;
+    // 新版 SQLCipher 路线不依赖设备材料：不中断，继续走解密（内部自动转 SQLCipher 内存密钥路线）
+    setStep('uuid', 'active', '注册表未找到设备材料——不影响新版 SQLCipher 解密（无需设备材料），继续…');
+  } else {
+    setStep('uuid', 'ok', `${disc.devIds.length} 组设备材料（${disc.materials.map((m) => m.label).join(' / ')}）`);
   }
-  setStep('uuid', 'ok', `${disc.devIds.length} 组设备材料（${disc.materials.map((m) => m.label).join(' / ')}）`);
 
   // ---- 步骤 2：EDB 数据文件清单 ----
   if (!disc.edbs.length) {
@@ -196,8 +197,8 @@ async function runAutoFlowWindows() {
     }
   }
   if (!candidates.length) {
-    setStep('uid', 'fail', '无法自动还原用户 ID——请在手动模式中填写 userId（KakaoTalk PC 版数字 ID）与设备材料');
-    return false;
+    // 新版 SQLCipher 路线无需 userId：不中断，继续解密（旧算法路线无候选必然不命中，会自动转 SQLCipher 内存密钥路线）
+    setStep('uid', 'active', '未自动还原用户 ID——不影响新版 SQLCipher 解密（无需 userId），继续…');
   }
 
   // ---- 步骤 4：参数求解 + 解密 ----

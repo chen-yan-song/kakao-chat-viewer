@@ -841,10 +841,16 @@ function readEdbBuffer(edb) {
  */
 async function decryptAllEdbs(edbs, materials, userIdCandidates, onProgress) {
   if (!edbs.length) return { ok: false, reason: '未找到 EDB 数据库文件' };
-  if (!materials.length) return { ok: false, reason: '注册表中未找到设备材料（dev_id），请确认已在 Windows 登录过 KakaoTalk' };
   const report = onProgress || (() => {});
   const sorted = [...edbs].filter((e) => (e.size == null ? true : e.size >= 16)).sort((a, b) => Math.max(a.size || 0, 1) - Math.max(b.size || 0, 1)); // 最小文件先试（求解最快）
   if (!sorted.length) return { ok: false, reason: 'EDB 文件均为空或过小' };
+  if (!materials.length) {
+    // 无设备材料时旧算法路线不可用，但新版 SQLCipher 内存密钥路线不依赖材料/userId
+    report('solve', '注册表无设备材料，直接尝试 SQLCipher 内存密钥恢复…');
+    const mem = await trySqlCipherFromMemory(sorted, report);
+    if (mem.ok) return mem;
+    return { ok: false, reason: `注册表中未找到设备材料（dev_id），且${mem.reason}` };
+  }
   let params = null;
   let probeBuf = null;
   let probePath = null;
