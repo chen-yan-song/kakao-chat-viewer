@@ -328,22 +328,27 @@ $fs = [System.IO.File]::Create($OutFile)
 $addr = [IntPtr]::Zero
 $buf = New-Object byte[] 16777216
 $read = 0
+$totalBytes = [long]0
+$commitCount = 0
+$matchedCount = 0
 while ($true) {
   $mbi = New-Object KkvMem+MEMORY_BASIC_INFORMATION
   $ret = [KkvMem]::VirtualQueryEx($h, $addr, [ref]$mbi, [Runtime.InteropServices.Marshal]::SizeOf($mbi))
   if ($ret -eq [IntPtr]::Zero) { break }
   $region = [int64]$mbi.RegionSize
   if ($mbi.State -eq 0x1000 -and $region -gt 0 -and $region -le 268435456) {
+    $commitCount++
     # 可读保护位（0x02/0x04/0x08/0x20/0x40/0x80），排除 PAGE_GUARD(0x100)；PrivateOnly 时仅 MEM_PRIVATE(0x20000) 堆内存
     $protOk = (($mbi.Protect -band 0xEE) -ne 0) -and (($mbi.Protect -band 0x100) -eq 0)
     $typeOk = (-not $PrivateOnly) -or ($mbi.Type -eq 0x20000)
     if ($protOk -and $typeOk) {
+    $matchedCount++
     $remain = $region
     $cur = [int64]$mbi.BaseAddress
     while ($remain -gt 0) {
       $take = [int][Math]::Min($remain, $buf.Length)
       $ok = [KkvMem]::ReadProcessMemory($h, [IntPtr]$cur, $buf, $take, [ref]$read)
-      if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read) }
+      if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read); $totalBytes += $read }
       $cur += $take
       $remain -= $take
     }
@@ -353,6 +358,7 @@ while ($true) {
   if ([int64]$addr -le 0) { break }
 }
 $fs.Close()
+Write-Output ("DUMPSTATS commit=$commitCount matched=$matchedCount bytes=$totalBytes")
 `;
   fs.writeFileSync(ps1, script, 'utf8');
   return ps1;
@@ -369,16 +375,22 @@ function dumpProcessMemory(pid, timeoutMs = 300000, { privateOnly = false } = {}
     const ps1 = writeMemoryDumpScript(os.tmpdir());
     const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-TargetPid', String(pid), '-OutFile', dumpPath];
     if (privateOnly) args.push('-PrivateOnly');
-    const child = spawn('powershell.exe', args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn('powershell.exe', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     const timer = setTimeout(() => { try { child.kill(); } catch { /* 忽略 */ } }, timeoutMs);
     child.on('close', (code) => {
       clearTimeout(timer);
+      const m = stdout.match(/DUMPSTATS commit=(\d+) matched=(\d+) bytes=(\d+)/);
+      const dumpStats = m ? { commit: Number(m[1]), matched: Number(m[2]), bytes: Number(m[3]) } : null;
+      let size = 0;
+      try { size = fs.statSync(dumpPath).size; } catch { /* 文件不存在 */ }
       if (code !== 0 || !fs.existsSync(dumpPath)) {
-        return resolve({ ok: false, reason: '内存导出失败：' + (stderr.trim() || `exit ${code}`) });
+        return resolve({ ok: false, reason: '内存导出失败：' + (stderr.trim() || `exit ${code}`), dumpStats, size });
       }
-      resolve({ ok: true, dumpPath });
+      resolve({ ok: true, dumpPath, dumpStats, size });
     });
   });
 }
@@ -746,25 +758,44 @@ async function trySqlCipherFromMemory(edbs, onProgress) {
   if (!usable.length) return { ok: false, reason: '没有足够大（≥4KB）的 EDB 文件可用于 SQLCipher 密钥验证' };
   const desc = [...usable].sort((a, b) => (b.size || 0) - (a.size || 0));
   const probes = pickSqlCipherProbes(desc, 3);
-  let probeHeads;
-  try {
-    probeHeads = probes.map((p) => ({ name: p.name, buf: readEdbHead(p, 8192) }));
-  } catch (e) {
-    return { ok: false, reason: `无法读取探针 EDB：${e.message}` };
-  }
-  report('solve', `SQLCipher 探针：${probeHeads.map((p) => p.name).join('、')}`);
+  const probeInfo = [];
+  const probeHeads = probes.map((p) => {
+    let buf = Buffer.alloc(0);
+    try {
+      buf = readEdbHead(p, 8192);
+    } catch (e) {
+      probeInfo.push(`${p.name}:读取失败(${e.code || e.message})`);
+      return { name: p.name, buf };
+    }
+    if (buf.length >= 4096) probeInfo.push(`${p.name}:${buf.length}B`);
+    else probeInfo.push(`${p.name}:仅${buf.length}B(不足一页,可能被占用)`);
+    return { name: p.name, buf };
+  });
+  report('solve', `SQLCipher 探针：${probeInfo.join('、')}`);
 
-  const stats = { pids: [], hexWrapped: 0, hexBare: 0, binScanned: 0, binCandidates: 0, rounds: [] };
+  const stats = { pidsFound: pids.length, pids: [], dumpMB: 0, dumpStats: null, probeInfo, hexWrapped: 0, hexBare: 0, binScanned: 0, binCandidates: 0, rounds: [] };
   for (const pid of pids.slice(0, 3)) {
     report('solve', `导出 KakaoTalk 进程内存（PID ${pid}，仅私有内存）…`);
-    const dump = await dumpProcessMemory(pid, 300000, { privateOnly: true });
+    let dump = await dumpProcessMemory(pid, 300000, { privateOnly: true });
+    if (dump.ok && (dump.size || 0) < 1024 * 1024) {
+      // 私有内存过滤在本机可能过严（不同 KakaoTalk 版本内存布局差异）：回退导出全部可读内存
+      report('warn', `PID ${pid} 私有内存仅 ${((dump.size || 0) / 1048576).toFixed(1)}MB，回退导出全部可读内存…`);
+      const full = await dumpProcessMemory(pid, 300000, { privateOnly: false });
+      if (full.ok && (full.size || 0) > (dump.size || 0)) {
+        try { fs.unlinkSync(dump.dumpPath); } catch { /* 忽略 */ }
+        dump = full;
+      } else if (full.ok) {
+        try { fs.unlinkSync(full.dumpPath); } catch { /* 忽略 */ }
+      }
+    }
     if (!dump.ok) {
       report('warn', `PID ${pid} 内存导出失败：${dump.reason}`);
       continue;
     }
     stats.pids.push(pid);
-    let dumpSize = 0;
-    try { dumpSize = fs.statSync(dump.dumpPath).size; } catch { /* 忽略 */ }
+    const dumpSize = dump.size || 0;
+    stats.dumpMB = Math.max(stats.dumpMB, Math.round((dumpSize / 1048576) * 10) / 10);
+    if (dump.dumpStats) stats.dumpStats = dump.dumpStats;
     report('solve', `内存导出完成（${(dumpSize / 1048576).toFixed(0)} MB），开始扫描密钥…`);
     try {
       // 轮1：hex 文本形态密钥（x'' 包装优先，再裸 64hex），秒级
@@ -790,9 +821,10 @@ async function trySqlCipherFromMemory(edbs, onProgress) {
       try { fs.unlinkSync(dump.dumpPath); } catch { /* 清理失败不阻塞 */ }
     }
   }
+  const dstat = stats.dumpStats ? `，提交区 ${stats.dumpStats.commit}/命中 ${stats.dumpStats.matched}` : '';
   return {
     ok: false,
-    reason: `内存中未找到有效 SQLCipher 密钥（进程=${stats.pids.join(',') || '无'}，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`,
+    reason: `内存中未找到有效 SQLCipher 密钥（发现进程 ${stats.pidsFound} 个/成功导出 [${stats.pids.join(',') || '无'}]，导出内存 ${stats.dumpMB}MB${dstat}，探针[${stats.probeInfo.join(' ')}]，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`,
   };
 }
 
