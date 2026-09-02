@@ -223,10 +223,17 @@ async function runAutoFlowWindows() {
     setStep('decrypt', 'fail', dec.reason);
     return false;
   }
-  setStep('uid', 'ok', `用户 ID ${dec.params.userId}（已由参数求解验证）`);
+  const isSqlcipher = dec.params.kind === 'sqlcipher';
+  if (isSqlcipher) {
+    setStep('uid', 'ok', 'SQLCipher 密钥已从进程内存恢复（新版加密，无需 userId）');
+  } else {
+    setStep('uid', 'ok', `用户 ID ${dec.params.userId}（已由参数求解验证）`);
+  }
   setStep('decrypt', 'active', `解密成功 ${dec.files.length} 个 EDB，正在汇总为统一查询库…`);
 
-  const ok = await controls.tryOpenWindows(dec.files, dec.params.userId, disc);
+  // SQLCipher 路线无 userId：用密钥哈希作派生种子（仅需自洽，统一库密钥与源库无关）
+  const winUserId = dec.params.userId || `sqlcipher-${String(dec.params.keyHex || 'mem').slice(0, 16)}`;
+  const ok = await controls.tryOpenWindows(dec.files, winUserId, disc);
   if (!ok) return false; // 错误详情由 openWindowsDatabase 呈现
 
   setStep('decrypt', 'ok', '汇总完成，正在加载聊天记录…');

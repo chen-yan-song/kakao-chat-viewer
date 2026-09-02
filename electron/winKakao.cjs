@@ -96,11 +96,17 @@ function buildMaterials(devIds, fields = []) {
   const serials = val(/serial/i);
   for (const u of uuids) {
     push(u, '注册表 uuid 单串');
+    const uLower = u.toLowerCase();
+    const uUpper = u.toUpperCase();
+    if (uLower !== u) push(uLower, '注册表 uuid 单串（小写）');
+    if (uUpper !== u) push(uUpper, '注册表 uuid 单串（大写）');
     for (const mo of models) {
       for (const s of serials) {
         push(`${u}|${mo}|${s}`, '注册表 uuid|model|serial');
         const s2 = s.replace(/\.$/, '');
         if (s2 !== s) push(`${u}|${mo}|${s2}`, '注册表 uuid|model|serial（serial 去尾点）');
+        if (uLower !== u) push(`${uLower}|${mo}|${s2}`, 'uuid 小写|model|serial（serial 去尾点）');
+        if (uUpper !== u) push(`${uUpper}|${mo}|${s}`, 'uuid 大写|model|serial');
       }
     }
   }
@@ -348,18 +354,16 @@ $fs.Close()
 }
 
 /**
- * dump KakaoTalk 进程内存并提取 userId 候选（加权统计）
- * @returns {Promise<{ok:boolean, candidates:Array, reason?:string, dumpPath?:string}>}
+ * dump 指定进程内存到临时文件（P/Invoke，仅同用户权限）；调用方负责删除 dump 文件
+ * @returns {Promise<{ok:boolean, dumpPath?:string, reason?:string}>}
  */
-function extractUserIdFromMemory(timeoutMs = 300000) {
-  return new Promise(async (resolve) => {
-    const { running, pids } = await isKakaoTalkRunning();
-    if (!running) return resolve({ ok: false, candidates: [], reason: 'KakaoTalk 未在运行，无法扫描内存' });
-    const dumpPath = path.join(os.tmpdir(), `kkv-mem-${pids[0]}.dmp`);
+function dumpProcessMemory(pid, timeoutMs = 300000) {
+  return new Promise((resolve) => {
+    const dumpPath = path.join(os.tmpdir(), `kkv-mem-${pid}.dmp`);
     const ps1 = writeMemoryDumpScript(os.tmpdir());
     const child = spawn(
       'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-TargetPid', String(pids[0]), '-OutFile', dumpPath],
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-TargetPid', String(pid), '-OutFile', dumpPath],
       { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] }
     );
     let stderr = '';
@@ -368,16 +372,28 @@ function extractUserIdFromMemory(timeoutMs = 300000) {
     child.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0 || !fs.existsSync(dumpPath)) {
-        return resolve({ ok: false, candidates: [], reason: '内存导出失败：' + (stderr.trim() || `exit ${code}`) });
+        return resolve({ ok: false, reason: '内存导出失败：' + (stderr.trim() || `exit ${code}`) });
       }
-      try {
-        const candidates = scanDumpForUserId(dumpPath);
-        resolve({ ok: candidates.length > 0, candidates, dumpPath });
-      } catch (e) {
-        resolve({ ok: false, candidates: [], reason: '内存分析失败：' + e.message });
-      }
+      resolve({ ok: true, dumpPath });
     });
   });
+}
+
+/**
+ * dump KakaoTalk 进程内存并提取 userId 候选（加权统计）
+ * @returns {Promise<{ok:boolean, candidates:Array, reason?:string, dumpPath?:string}>}
+ */
+async function extractUserIdFromMemory(timeoutMs = 300000) {
+  const { running, pids } = await isKakaoTalkRunning();
+  if (!running) return { ok: false, candidates: [], reason: 'KakaoTalk 未在运行，无法扫描内存' };
+  const dump = await dumpProcessMemory(pids[0], timeoutMs);
+  if (!dump.ok) return { ok: false, candidates: [], reason: dump.reason };
+  try {
+    const candidates = scanDumpForUserId(dump.dumpPath);
+    return { ok: candidates.length > 0, candidates, dumpPath: dump.dumpPath };
+  } catch (e) {
+    return { ok: false, candidates: [], reason: '内存分析失败：' + e.message };
+  }
 }
 
 /** 流式扫描 dump 文件，跑四种 userId 正则并加权 */
@@ -405,6 +421,157 @@ function scanDumpForUserId(dumpPath) {
   fs.closeSync(fd);
   try { fs.unlinkSync(dumpPath); } catch { /* 清理失败不阻塞 */ }
   return weightedUserId(counts);
+}
+
+/* ============ SQLCipher 4：内存 raw key 恢复（新版 KakaoTalk EDB）============ */
+
+const SQLITE_HEAD_BUF = Buffer.from(SQLITE_HEAD, 'latin1');
+
+/**
+ * 流式扫描 dump 提取 SQLCipher raw key 候选（64 位 hex）。
+ * 优先 x'…' 包装形式（SQLCipher PRAGMA key 原始格式）；includeBare=true 时扩大到裸 64hex。
+ */
+function scanDumpForRawKeys(dumpPath, { includeBare = false, maxKeys = 200000 } = {}) {
+  const wrapped = new Set();
+  const bare = new Set();
+  const WRAP_RE = /x'([0-9a-fA-F]{64})'/g;
+  const BARE_RE = /\b[0-9a-fA-F]{64}\b/g;
+  const fd = fs.openSync(dumpPath, 'r');
+  const size = fs.fstatSync(fd).size;
+  const CHUNK = 8 * 1024 * 1024;
+  const OVERLAP = 128; // 正则跨界重叠
+  const buf = Buffer.alloc(CHUNK + OVERLAP);
+  let tail = Buffer.alloc(0);
+  for (let off = 0; off < size; off += CHUNK) {
+    const got = fs.readSync(fd, buf, 0, CHUNK + OVERLAP, off);
+    if (got <= 0) break;
+    const text = Buffer.concat([tail, buf.subarray(0, got)]).toString('latin1');
+    tail = Buffer.from(text.slice(text.length - OVERLAP), 'latin1');
+    for (const m of text.matchAll(WRAP_RE)) wrapped.add(m[1].toLowerCase());
+    if (includeBare) {
+      for (const m of text.matchAll(BARE_RE)) {
+        const v = m[0].toLowerCase();
+        if (!wrapped.has(v)) bare.add(v);
+      }
+    }
+    if (wrapped.size + bare.size > maxKeys) break;
+  }
+  fs.closeSync(fd);
+  return { keys: [...wrapped, ...bare], wrappedCount: wrapped.size };
+}
+
+/** 用页1验证 SQLCipher raw key；命中返回页参数。
+ * 加密库页1前 16 字节是随机盐（覆盖了 SQLite 文件头），解密数据从 header offset16 开始：
+ * 验证 page_size 大端值、恒定魔数 0x40 0x20 0x20、reserved == 16+hmacSize（自动区分变体） */
+function trySqlCipherParams(edbBuf, keyBytes) {
+  if (!Buffer.isBuffer(keyBytes) || keyBytes.length !== 32) return null;
+  if (!Buffer.isBuffer(edbBuf) || edbBuf.length < 1024) return null;
+  for (const pageSize of [4096, 1024]) {
+    if (edbBuf.length < pageSize) continue;
+    for (const hmacSize of [64, 32, 0]) {
+      const ivOff = pageSize - hmacSize - 16;
+      if (ivOff <= 16) continue;
+      let d;
+      try {
+        d = crypto.createDecipheriv('aes-256-cbc', keyBytes, edbBuf.subarray(ivOff, ivOff + 16));
+      } catch {
+        return null; // key/iv 非法
+      }
+      d.setAutoPadding(false);
+      const dec = d.update(edbBuf.subarray(16, 16 + 32)); // 页1密文头（盐后 32 字节）
+      if (
+        dec[0] === (pageSize >> 8) && dec[1] === (pageSize & 0xff) &&
+        dec[4] === 16 + hmacSize &&
+        dec[5] === 0x40 && dec[6] === 0x20 && dec[7] === 0x20
+      ) return { pageSize, hmacSize };
+    }
+  }
+  return null;
+}
+
+/**
+ * SQLCipher 页级解密：每页 [密文 data][IV][HMAC] → 明文页尾补零（保留区），
+ * 页1 前部 16 字节盐明文还原为 SQLite 头。产物可被标准 SQLite/SQLCipher 打开。
+ */
+function decryptSqlCipherEdb(buf, keyBytes, pageSize, hmacSize) {
+  const dataLen = pageSize - 16 - hmacSize;
+  const pages = Math.floor(buf.length / pageSize);
+  const out = Buffer.alloc(pages * pageSize);
+  SQLITE_HEAD_BUF.copy(out, 0);
+  for (let p = 0; p < pages; p++) {
+    const base = p * pageSize;
+    const start = p === 0 ? 16 : base; // 页1 跳过明文盐
+    const len = p === 0 ? dataLen - 16 : dataLen;
+    const ivOff = base + pageSize - hmacSize - 16;
+    const d = crypto.createDecipheriv('aes-256-cbc', keyBytes, buf.subarray(ivOff, ivOff + 16));
+    d.setAutoPadding(false);
+    const dec = Buffer.concat([d.update(buf.subarray(start, start + len)), d.final()]);
+    dec.copy(out, base + (p === 0 ? 16 : 0));
+  }
+  return out;
+}
+
+/**
+ * SQLCipher 内存密钥恢复路线：dump KakaoTalk 进程 → 扫描 64hex raw key 候选 →
+ * 在最小 EDB 页1验证 → 命中后解密全部（新版 KakaoTalk，不依赖设备材料与 userId）
+ */
+async function trySqlCipherFromMemory(edbs, onProgress) {
+  const report = onProgress || (() => {});
+  const { running, pids } = await isKakaoTalkRunning();
+  if (!running) return { ok: false, reason: '内存密钥恢复需要 KakaoTalk 正在运行（请先启动并登录 KakaoTalk）' };
+  const usable = edbs.filter((e) => (e.size == null ? true : e.size >= 1024));
+  if (!usable.length) return { ok: false, reason: '没有可用于验证密钥的 EDB 文件' };
+  const probe = usable[0];
+  let probeBuf;
+  try {
+    probeBuf = readEdbBuffer(probe);
+  } catch (e) {
+    return { ok: false, reason: `无法读取 ${probe.name}：${e.message}` };
+  }
+  report('solve', `导出 KakaoTalk 进程内存（PID ${pids[0]}）…`);
+  const dump = await dumpProcessMemory(pids[0]);
+  if (!dump.ok) return { ok: false, reason: dump.reason };
+  try {
+    const verify = (keys, label) => {
+      let tried = 0;
+      for (const hex of keys) {
+        tried++;
+        if (tried % 5000 === 0) report('solve', `${label}：已验证 ${tried}/${keys.length} 个密钥候选…`);
+        const params = trySqlCipherParams(probeBuf, Buffer.from(hex, 'hex'));
+        if (params) return { keyHex: hex, ...params };
+      }
+      return null;
+    };
+    let scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: false });
+    report('solve', `内存中发现 ${scan.wrappedCount} 个包装密钥候选，验证中…`);
+    let hit = scan.keys.length ? verify(scan.keys, '包装密钥') : null;
+    if (!hit) {
+      scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: true });
+      report('solve', `扩大扫描：共 ${scan.keys.length} 个 64hex 候选，验证中（可能需要数十秒）…`);
+      hit = scan.keys.length ? verify(scan.keys, '全量候选') : null;
+    }
+    if (!hit) return { ok: false, reason: '内存中未找到有效 SQLCipher 密钥（请确认 KakaoTalk 已登录并打开过聊天窗口）' };
+    report('found', `SQLCipher 密钥命中：${hit.keyHex.slice(0, 16)}…（page=${hit.pageSize}，hmac=${hit.hmacSize}）`);
+    const keyBytes = Buffer.from(hit.keyHex, 'hex');
+    const files = [];
+    for (let i = 0; i < usable.length; i++) {
+      const edb = usable[i];
+      report('decrypt', `解密 ${edb.name}（${i + 1}/${usable.length}）…`);
+      try {
+        const buf = readEdbBuffer(edb);
+        const plain = decryptSqlCipherEdb(buf, keyBytes, hit.pageSize, hit.hmacSize);
+        if (plain.subarray(0, 16).equals(SQLITE_HEAD_BUF)) {
+          files.push({ name: edb.name, path: edb.path, chatId: edb.chatId, size: edb.size, data: new Uint8Array(plain) });
+        }
+      } catch (e) {
+        report('warn', `${edb.name} 解密失败：${e.message}`);
+      }
+    }
+    if (!files.length) return { ok: false, reason: 'SQLCipher 密钥命中但没有任何 EDB 解密成功' };
+    return { ok: true, params: { kind: 'sqlcipher', keyHex: hit.keyHex, userId: null, pragma: null }, files };
+  } finally {
+    try { fs.unlinkSync(dump.dumpPath); } catch { /* 清理失败不阻塞 */ }
+  }
 }
 
 /* ============ 汇总：Windows 自动发现 ============ */
@@ -471,12 +638,15 @@ async function decryptAllEdbs(edbs, materials, userIdCandidates, onProgress) {
     if (params) break;
   }
   if (!params) {
+    report('solve', '设备材料派生路线未命中，尝试 SQLCipher 内存密钥恢复…');
+    const mem = await trySqlCipherFromMemory(sorted, report);
+    if (mem.ok) return mem;
     const labels = materials.map((m) => `${m.label}(${m.input.slice(0, 24)}${m.input.length > 24 ? '…' : ''})`).join('；');
     return {
       ok: false,
-      reason: `未找到有效解密参数：${materials.length} 种材料 × ${CANDIDATE_KEYS.length} 个内置key × ${userIdCandidates.length} 个userId候选 全部不匹配。` +
-        `材料列表=[${labels}]，userId候选=[${userIdCandidates.map((u) => u.num || u).join(', ') || '无'}]。` +
-        `请运行 Release 页提供的 win-diagnostic.ps1 诊断脚本，把输出发回以定位材料格式`,
+      reason: `未找到有效解密参数：${materials.length} 种材料 × ${CANDIDATE_KEYS.length} 个内置key × ${userIdCandidates.length} 个userId候选 全部不匹配；${mem.reason}。` +
+        `材料列表=[${labels}]，userId候选=[${userIdCandidates.map((u) => u.num || u).join(', ') || '无'}]，探针首16字节=[${probeBuf ? probeBuf.subarray(0, 16).toString('hex') : '不可读'}]。` +
+        `请保持 KakaoTalk 登录并打开过聊天列表后重试；仍失败请运行 Release 页的 win-diagnostic.ps1 并发回输出`,
     };
   }
   report('found', `参数命中：keyIdx=${CANDIDATE_KEYS.indexOf(params.keyHex) + 1}，userId=${params.userId}，材料=${params.material.label}`);
@@ -518,4 +688,9 @@ module.exports = {
   discoverWindows,
   decryptAllEdbs,
   kakaoBaseDir,
+  dumpProcessMemory,
+  scanDumpForRawKeys,
+  trySqlCipherParams,
+  decryptSqlCipherEdb,
+  trySqlCipherFromMemory,
 };

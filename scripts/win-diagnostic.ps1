@@ -149,7 +149,8 @@ if (-not (Test-Path $usersDir)) {
 }
 $edbs = @()
 if (Test-Path $usersDir) {
-  $edbs = @(Get-ChildItem -Path $usersDir -Recurse -Filter *.edb -ErrorAction SilentlyContinue | Sort-Object Length)
+  # 注意：不能用 -Filter *.edb（Windows 8.3 短名会把 .edb-wal 也匹配上），用正则精确匹配 .edb 结尾
+  $edbs = @(Get-ChildItem -Path $usersDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)\.edb$' } | Sort-Object Length)
 }
 if ($edbs.Count -eq 0) {
   Out-Line 'No .edb files found!'
@@ -270,11 +271,20 @@ if ($edbs.Count -eq 0) {
 } elseif ($materials.Count -eq 0) {
   Out-Line 'No material variants. Send this output back (registry section above is critical).'
 } else {
-  $probe = $edbs | Where-Object { $_.Name -match '^chatLogs' } | Select-Object -First 1
+  $probe = $edbs | Where-Object { $_.Name -match '(?i)^chatLogs' } | Select-Object -First 1
   if (-not $probe) { $probe = $edbs | Select-Object -First 1 }
-  $edbBytes = [System.IO.File]::ReadAllBytes($probe.FullName)
+  $edbBytes = $null
+  try { $edbBytes = [System.IO.File]::ReadAllBytes($probe.FullName) } catch {}
   Out-Line ('Probe: ' + $probe.Name + ' (' + $probe.Length + ' bytes)')
-  Out-Line ('First 16 bytes: ' + (($edbBytes[0..15] | ForEach-Object { $_.ToString('x2') }) -join ' '))
+  if ($edbBytes -and $edbBytes.Length -ge 16) {
+    $take = [Math]::Min(32, $edbBytes.Length)
+    Out-Line ('First 32 bytes: ' + (($edbBytes[0..($take-1)] | ForEach-Object { $_.ToString('x2') }) -join ' '))
+  } else {
+    Out-Line 'Probe unreadable (locked by KakaoTalk?) - close KakaoTalk and rerun'
+  }
+  if (-not $edbBytes -or $edbBytes.Length -lt 4096) {
+    Out-Line 'Probe is under 4096 bytes or unreadable - cannot solve. Send this output back.'
+  } else {
   Out-Line ('Solving: ' + $materials.Count + ' materials x 15 keys x ' + $uids.Count + ' userIds ...')
 
   $found = $null
@@ -306,7 +316,11 @@ if ($edbs.Count -eq 0) {
     Out-Line ''
     Out-Line 'Next: update the app, or use manual mode with the material string above as the device input and the userId above.'
   } else {
-    Out-Line 'NOT FOUND with any combination. Send this whole output back - the registry section and first-16-bytes are the key clues.'
+    Out-Line 'NOT FOUND with legacy algorithm.'
+    Out-Line 'Interpretation hint: if the first 32 bytes look random (no plain-text header), the EDB is likely SQLCipher 4 encrypted -'
+    Out-Line 'use the app (new build) with KakaoTalk running: it will auto-recover the raw key from process memory.'
+    Out-Line 'Send this whole output back anyway - the registry section and first-32-bytes are the key clues.'
+  }
   }
 }
 
