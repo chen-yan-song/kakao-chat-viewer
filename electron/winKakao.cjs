@@ -41,7 +41,7 @@ const SQLITE_HEAD = 'SQLite format 3\x00';
 
 /* ============ 注册表：设备材料 ============ */
 
-/** 读取 HKCU\Software\Kakao\KakaoTalk\DeviceInfo 全部子键的 dev_id */
+/** 读取 HKCU\Software\Kakao\KakaoTalk\DeviceInfo 全部子键的全部值（dev_id/uuid/model/serial…） */
 function readDeviceInfo() {
   return new Promise((resolve) => {
     execFile(
@@ -49,29 +49,58 @@ function readDeviceInfo() {
       ['query', 'HKCU\\Software\\Kakao\\KakaoTalk\\DeviceInfo', '/s'],
       { encoding: 'utf8', timeout: 15000, maxBuffer: 8 * 1024 * 1024, windowsHide: true },
       (err, stdout) => {
-        if (err) return resolve({ ok: false, reason: err.message, devIds: [], materials: [] });
+        if (err) return resolve({ ok: false, reason: err.message, devIds: [], fields: [], materials: [] });
         const devIds = [];
+        const fields = []; // { key: 子键, name: 值名, value: 值 }
+        let curKey = '';
         for (const line of String(stdout).split(/\r?\n/)) {
-          // 形如：    dev_id    REG_SZ    uuid|model|serial
-          const m = line.match(/^\s+dev_id\s+REG_[A-Z]+\s+(.+)$/i);
-          if (m) devIds.push(m[1].trim());
+          const km = line.match(/^HKEY_CURRENT_USER\\Software\\Kakao\\KakaoTalk\\DeviceInfo(.*)$/i);
+          if (km) { curKey = km[1].replace(/^\\/, ''); continue; }
+          // 形如：    值名    REG_SZ    值
+          const m = line.match(/^\s+(\S+)\s+REG_[A-Z]+\s+(.*)$/);
+          if (m) {
+            const name = m[1];
+            const value = m[2].trim();
+            fields.push({ key: curKey, name, value });
+            if (/^dev_id$/i.test(name)) devIds.push(value);
+          }
         }
-        resolve({ ok: devIds.length > 0, devIds, materials: buildMaterials(devIds) });
+        resolve({ ok: fields.length > 0, devIds, fields, materials: buildMaterials(devIds, fields) });
       }
     );
   });
 }
 
-/** 由 dev_id 生成材料变体（原串优先，三段拆分重组兜底） */
-function buildMaterials(devIds) {
+/**
+ * 由注册表字段生成材料变体：
+ *   1. dev_id 原串 / 三段重组
+ *   2. uuid|model|serial 独立值组合（kdevil2k generate_pragma 的标准材料），含 serial 尾点去留两变体
+ *   3. uuid 单串兜底
+ */
+function buildMaterials(devIds, fields = []) {
   const materials = [];
+  const push = (input, label) => {
+    if (input && !materials.some((m) => m.input === input)) materials.push({ input, label });
+  };
   for (const d of devIds) {
-    const raw = d.trim();
-    if (raw) materials.push({ input: raw, label: 'dev_id 原串' });
+    const raw = String(d).trim();
+    push(raw, 'dev_id 原串');
     if (raw.includes('|')) {
       const parts = raw.split('|').map((s) => s.trim());
-      if (parts.length >= 3) {
-        materials.push({ input: `${parts[0]}|${parts[1]}|${parts[2]}`, label: 'dev_id 三段重组' });
+      if (parts.length >= 3) push(`${parts[0]}|${parts[1]}|${parts[2]}`, 'dev_id 三段重组');
+    }
+  }
+  const val = (re) => fields.filter((f) => re.test(f.name) && f.value).map((f) => f.value.trim());
+  const uuids = val(/uuid/i);
+  const models = val(/model/i);
+  const serials = val(/serial/i);
+  for (const u of uuids) {
+    push(u, '注册表 uuid 单串');
+    for (const mo of models) {
+      for (const s of serials) {
+        push(`${u}|${mo}|${s}`, '注册表 uuid|model|serial');
+        const s2 = s.replace(/\.$/, '');
+        if (s2 !== s) push(`${u}|${mo}|${s2}`, '注册表 uuid|model|serial（serial 去尾点）');
       }
     }
   }
@@ -402,6 +431,7 @@ async function discoverWindows() {
     pids: procInfo.pids,
     userIdCandidates: fileUid.candidates,
     fileUidSource: 'KakaoTalk 目录文件扫描',
+    registryFields: dev.fields,
   };
 }
 
@@ -441,7 +471,13 @@ async function decryptAllEdbs(edbs, materials, userIdCandidates, onProgress) {
     if (params) break;
   }
   if (!params) {
-    return { ok: false, reason: `在 ${materials.length} 种材料 × ${CANDIDATE_KEYS.length} 个内置key × userId 候选范围内未找到有效解密参数（可手动填写 userId 重试）` };
+    const labels = materials.map((m) => `${m.label}(${m.input.slice(0, 24)}${m.input.length > 24 ? '…' : ''})`).join('；');
+    return {
+      ok: false,
+      reason: `未找到有效解密参数：${materials.length} 种材料 × ${CANDIDATE_KEYS.length} 个内置key × ${userIdCandidates.length} 个userId候选 全部不匹配。` +
+        `材料列表=[${labels}]，userId候选=[${userIdCandidates.map((u) => u.num || u).join(', ') || '无'}]。` +
+        `请运行 Release 页提供的 win-diagnostic.ps1 诊断脚本，把输出发回以定位材料格式`,
+    };
   }
   report('found', `参数命中：keyIdx=${CANDIDATE_KEYS.indexOf(params.keyHex) + 1}，userId=${params.userId}，材料=${params.material.label}`);
   const files = [];
