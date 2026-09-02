@@ -73,15 +73,24 @@
         <!-- 第 1 步：UUID -->
         <div class="card">
           <h3><span class="step-num">1</span> 设备 UUID</h3>
-          <label class="field-label" for="uuidInput">Mac 硬件 UUID（IOPlatformUUID）</label>
+          <label class="field-label" for="uuidInput">Mac 硬件 UUID（IOPlatformUUID）／Windows 设备材料（dev_id）</label>
           <input id="uuidInput" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="例如 A1B2C3D4-5E6F-7890-AB12-CD34567890EF" />
+                 placeholder="例如 A1B2C3D4-5E6F-7890-AB12-CD34567890EF 或 uuid|硬盘型号|序列号" />
           <details class="hint-details">
             <summary>如何获取 UUID？</summary>
             <div class="hint-body">
               在「终端」中运行以下命令，复制输出结果：
               <pre>ioreg -d2 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/{print $(NF-1)}'</pre>
               该 UUID 仅用于本地密钥派生（与 kakaocli 相同算法），不会上传。
+            </div>
+          </details>
+          <details class="hint-details">
+            <summary>Windows 手动模式：如何获取设备材料（dev_id）？</summary>
+            <div class="hint-body">
+              在「命令提示符」中运行（需已在本机登录过 KakaoTalk PC 版）：
+              <pre>reg query "HKCU\Software\Kakao\KakaoTalk\DeviceInfo" /s</pre>
+              把 dev_id 的完整值（uuid|硬盘型号|序列号 格式）填入上方输入框，
+              EDB 文件可选多个（chatLogs_*.edb、TalkUserDB.edb 等）。
             </div>
           </details>
         </div>

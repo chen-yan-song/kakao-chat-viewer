@@ -167,18 +167,106 @@ function validUserId() {
 
 /** 根据输入状态刷新「解密」按钮 */
 function refreshOpenBtn() {
-  const uuidOk = isValidUUID(el.uuidInput.value);
+  const winMode = isWindowsMaterialMode();
+  const uuidOk = winMode ? uuidOrMaterialOk() : isValidUUID(el.uuidInput.value);
   const uidOk = validUserId() !== null;
   const fileOk = state.mainFile !== null;
   const ok = uuidOk && uidOk && fileOk;
   el.openBtn.disabled = !ok;
   const missing = [];
-  if (!uuidOk) missing.push('UUID');
+  if (!uuidOk) missing.push(winMode ? '设备材料' : 'UUID');
   if (!uidOk) missing.push('用户 ID');
-  if (!fileOk) missing.push('数据库文件');
+  if (!fileOk) missing.push(winMode ? 'EDB 文件' : '数据库文件');
   el.openHint.textContent = ok
     ? '准备就绪，点击开始解密（首次加载 WASM 需几秒）'
     : `请填写：${missing.join('、')}`;
+}
+
+// ============ Windows EDB 模式 ============
+/** 当前选中的主文件是否为 Windows EDB（聊天日志/好友库等） */
+function isWindowsMaterialMode() {
+  return !!(state.mainFile && /\.edb$/i.test(state.mainFile.name));
+}
+
+/** uuid 输入框允许标准 UUID 或 Windows 设备材料串（uuid|model|serial） */
+function uuidOrMaterialOk() {
+  const v = el.uuidInput.value.trim();
+  return (
+    isValidUUID(v) ||
+    (v.includes('|') && v.split('|').filter((s) => s.trim()).length >= 3)
+  );
+}
+
+/** 由 dev_id 原串构造材料变体（与 electron/winKakao.cjs 的 buildMaterials 一致） */
+function buildWinMaterials(devId) {
+  const raw = devId.trim();
+  const materials = [{ input: raw, label: 'dev_id 原串' }];
+  if (raw.includes('|')) {
+    const p = raw.split('|').map((s) => s.trim());
+    if (p.length >= 3) materials.push({ input: `${p[0]}|${p[1]}|${p[2]}`, label: 'dev_id 三段重组' });
+  }
+  return materials;
+}
+
+/**
+ * Windows 模式：EDB 解密/汇总后进入查看器
+ * @param {Array<{name:string, chatId:?string, size?:number, data?:Uint8Array}|File>} edbFiles
+ *   自动模式传含 data 的对象数组；手动模式传 File 列表
+ * @param {number} userId 已确认的用户 ID
+ * @param {object} [opts] 自动模式：{ materials, devId }
+ */
+async function openWindowsDatabase(edbFiles, userId, opts = {}) {
+  clearError();
+  el.openBtn.disabled = true;
+  el.progressArea.hidden = false;
+  el.progressBar.className = 'progress-bar indeterminate';
+  el.progressText.textContent = '准备 Windows 数据…';
+  try {
+    let materials;
+    let edbs;
+    if (opts.materials) {
+      materials = opts.materials;
+      edbs = edbFiles;
+    } else {
+      const devId = el.uuidInput.value.trim();
+      materials = buildWinMaterials(devId);
+      edbs = [];
+      for (const f of edbFiles) {
+        const data = await loadFileData(f);
+        const cm = f.name.match(/chatLogs[_-](\d+)\.edb$/i);
+        edbs.push({ name: f.name, chatId: cm ? cm[1] : null, size: data.byteLength, data });
+      }
+    }
+    const devId = opts.devId || el.uuidInput.value.trim();
+    const uuidPart = devId.includes('|') ? devId.split('|')[0].trim() : devId;
+    el.uuidInput.value = devId;
+    el.userIdInput.value = String(userId);
+
+    // Windows 密钥：PBKDF2(userId, 材料中的 uuid 段)——仅需派生稳定一致，不参与 EDB 解密
+    const key = await deriveSecureKey(userId, uuidPart);
+    el.progressText.textContent = '正在汇总统一查询库…';
+    const db = new KakaoDB();
+    await db.openUnifiedWindows(edbs, key, userId, (stage, detail) => {
+      if (stage === 'done') {
+        el.progressBar.className = 'progress-bar';
+        el.progressBar.style.width = '100%';
+        el.progressText.textContent = '✅ ' + detail;
+      } else {
+        el.progressText.textContent = detail;
+      }
+    });
+    state.db = db;
+    state.myId = db.myUserId() ?? userId;
+    await enterViewer();
+    return true;
+  } catch (e) {
+    el.progressBar.className = 'progress-bar';
+    el.progressBar.style.width = '0%';
+    el.progressArea.hidden = true;
+    showError('Windows 数据汇总失败：' + e.message);
+    el.openBtn.disabled = false;
+    return false;
+  }
 }
 
 // ============ plist 上传与 userId 提取 ============
@@ -441,7 +529,12 @@ async function openDatabase() {
   clearError();
   const uuid = el.uuidInput.value.trim();
   const userId = validUserId();
-  if (!isValidUUID(uuid) || userId === null || !state.mainFile) return false;
+  const winMode = isWindowsMaterialMode();
+  const uuidOk = winMode ? uuidOrMaterialOk() : isValidUUID(uuid);
+  if (!uuidOk || userId === null || !state.mainFile) return false;
+
+  // Windows EDB 手动模式：uuid 输入框填 dev_id材料串，直接走 EDB 解密通道
+  if (winMode) return openWindowsDatabase([state.mainFile], userId);
 
   // 解密前再按派生文件名校验一次主库选择，避免误选同目录的旧库
   await matchMainByDerivedName();
@@ -1339,6 +1432,7 @@ registerAuto({
   setStep: setAutoStep,
   applyDiscovery,
   tryOpenDatabase: openDatabase,
+  tryOpenWindows: openWindowsDatabase,
   autoMsg: showAutoMsg,
 });
 

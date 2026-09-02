@@ -153,6 +153,40 @@ ipcMain.handle('discover', async () => {
   };
 });
 
+// ============ IPC：Windows EDB 自动发现与解密 ============
+const winKakao = require('./winKakao.cjs');
+
+ipcMain.handle('win-discover', async () => {
+  if (process.platform !== 'win32') {
+    throw new Error('Windows 自动发现仅在 Windows 平台可用');
+  }
+  return winKakao.discoverWindows();
+});
+
+ipcMain.handle('win-userid-from-memory', async () => {
+  if (process.platform !== 'win32') {
+    throw new Error('内存提取仅在 Windows 平台可用');
+  }
+  return winKakao.extractUserIdFromMemory();
+});
+
+ipcMain.handle('win-decrypt', (_e, opts) => {
+  if (process.platform !== 'win32') {
+    throw new Error('EDB 解密仅在 Windows 平台可用');
+  }
+  const { materials = [], userIdCandidates = [], edbs = [] } = opts || {};
+  if (!Array.isArray(edbs) || edbs.length === 0) {
+    throw new Error('未指定 EDB 文件清单');
+  }
+  const onProgress = (stage, detail) => {
+    try {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (win && !win.isDestroyed()) win.webContents.send('win-progress', { stage, detail });
+    } catch { /* 忽略 */ }
+  };
+  return winKakao.decryptAllEdbs(edbs, materials, userIdCandidates, onProgress);
+});
+
 /** 读取数据库文件（仅允许 KakaoTalk 容器目录内路径） */
 function isAllowedPath(p) {
   const abs = path.resolve(String(p));

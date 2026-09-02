@@ -32,9 +32,14 @@ export function inElectron() {
   return typeof window !== 'undefined' && !!window.kakaoApp;
 }
 
-/** 是否 macOS 环境（自动发现依赖 macOS 沙盒容器与 ioreg，Windows 版仅支持手动模式） */
+/** 是否 macOS 环境（自动发现依赖 macOS 沙盒容器与 ioreg） */
 function isMacPlatform() {
   return /Macintosh|Mac OS X/.test(navigator.userAgent);
+}
+
+/** 是否 Windows 环境 */
+function isWindowsPlatform() {
+  return /Windows/.test(navigator.userAgent);
 }
 
 /** 运行全自动流程，成功返回 true；失败返回 false（并已显示手动兜底入口） */
@@ -47,11 +52,8 @@ export async function runAutoFlow() {
   }
 
   if (!isMacPlatform()) {
-    setStep('uuid', 'warn', '自动发现仅支持 macOS 版本（Windows 版 KakaoTalk 采用不同加密体系）');
-    controls.autoMsg(
-      '当前为 Windows 版：Windows 版 KakaoTalk 数据库加密体系不同，本工具仅作为聊天记录查看器使用——' +
-      '请点下方「使用手动模式」，加载从 Mac 端导出的数据库文件查看。'
-    );
+    if (isWindowsPlatform()) return runAutoFlowWindows();
+    setStep('uuid', 'fail', '自动发现仅支持 macOS / Windows 版本（Linux 请使用手动模式）');
     return false;
   }
 
@@ -138,6 +140,97 @@ export async function runAutoFlow() {
 
   setStep('decrypt', 'ok', '解密成功，正在加载聊天记录…');
   if (inElectron()) window.kakaoApp.log('[auto] 全部步骤完成');
+  return true;
+}
+
+/**
+ * Windows 全自动流程：注册表设备材料 → EDB 清单 → userId 还原（文件扫描/内存提取）→
+ * 参数求解 → 按页 AES 解密 → 汇总统一库
+ */
+async function runAutoFlowWindows() {
+  const app = window.kakaoApp;
+
+  // ---- 步骤 1：设备材料（注册表 dev_id）----
+  setStep('uuid', 'active', '正在读取注册表设备信息（DeviceInfo → dev_id）…');
+  let disc;
+  try {
+    disc = await app.winDiscover();
+  } catch (e) {
+    setStep('uuid', 'fail', 'Windows 自动发现失败：' + e.message);
+    return false;
+  }
+  if (!disc.devOk) {
+    setStep('uuid', 'fail', '注册表中未找到设备材料（dev_id）——请确认已在本机登录过 KakaoTalk PC 版');
+    return false;
+  }
+  setStep('uuid', 'ok', `${disc.devIds.length} 组设备材料（${disc.materials.map((m) => m.label).join(' / ')}）`);
+
+  // ---- 步骤 2：EDB 数据文件清单 ----
+  if (!disc.edbs.length) {
+    setStep('plist', 'fail', `未找到 EDB 数据文件（${disc.usersDir || disc.baseDir}）——请确认已在 KakaoTalk 中同步过聊天记录`);
+    return false;
+  }
+  const totalMB = disc.edbs.reduce((s, f) => s + (f.size || 0), 0) / 1024 / 1024;
+  setStep('plist', 'ok', `找到 ${disc.edbs.length} 个 EDB 文件（共 ${totalMB.toFixed(1)} MB）`);
+  if (disc.running) {
+    controls.autoMsg('检测到 KakaoTalk 正在运行：将同时从进程内存提取用户 ID（成功率更高）；若记录不全请退出 KakaoTalk 后重新检测。');
+  }
+
+  // ---- 步骤 3：userId 还原 ----
+  setStep('uid', 'active', '正在还原用户 ID…');
+  let candidates = (disc.userIdCandidates || []).map((c) => c.num);
+  if (candidates.length) {
+    setStep('uid', 'active', `文件扫描候选：${candidates.join(', ')}`);
+  }
+  if (disc.running) {
+    setStep('uid', 'active', 'KakaoTalk 运行中：正在导出进程内存并提取用户 ID（可能需要 1-3 分钟）…');
+    try {
+      const mem = await app.winUserIdFromMemory();
+      if (mem.ok) {
+        const nums = mem.candidates.map((c) => c.num);
+        candidates = [...new Set([...nums, ...candidates])];
+        setStep('uid', 'active', `内存提取候选：${nums.join(', ')}（结合文件扫描共 ${candidates.length} 个）`);
+      }
+    } catch (e) {
+      setStep('uid', 'active', `内存提取失败（${e.message}），继续用文件扫描候选…`);
+    }
+  }
+  if (!candidates.length) {
+    setStep('uid', 'fail', '无法自动还原用户 ID——请在手动模式中填写 userId（KakaoTalk PC 版数字 ID）与设备材料');
+    return false;
+  }
+
+  // ---- 步骤 4：参数求解 + 解密 ----
+  setStep('db', 'ok', `已定位 ${disc.edbs.length} 个 EDB 文件`);
+  if (app.onWinProgress) {
+    app.onWinProgress(({ detail }) => {
+      setStep('decrypt', 'active', detail);
+    });
+  }
+  setStep('decrypt', 'active', '求解解密参数并按页解密 EDB…');
+  let dec;
+  try {
+    dec = await app.winDecrypt({
+      materials: disc.materials,
+      userIdCandidates: candidates,
+      edbs: disc.edbs,
+    });
+  } catch (e) {
+    setStep('decrypt', 'fail', '解密失败：' + e.message);
+    return false;
+  }
+  if (!dec.ok) {
+    setStep('decrypt', 'fail', dec.reason);
+    return false;
+  }
+  setStep('uid', 'ok', `用户 ID ${dec.params.userId}（已由参数求解验证）`);
+  setStep('decrypt', 'active', `解密成功 ${dec.files.length} 个 EDB，正在汇总为统一查询库…`);
+
+  const ok = await controls.tryOpenWindows(dec.files, dec.params.userId, disc);
+  if (!ok) return false; // 错误详情由 openWindowsDatabase 呈现
+
+  setStep('decrypt', 'ok', '汇总完成，正在加载聊天记录…');
+  if (inElectron()) window.kakaoApp.log('[auto] Windows 全部步骤完成');
   return true;
 }
 

@@ -206,6 +206,170 @@ export class KakaoDB {
     return queryRaw(this.module, this.db.dbPtr, sql, params);
   }
 
+  /**
+   * Windows 模式：把多份已解密的 EDB（明文 SQLite 字节）汇总为统一结构库后打开
+   *
+   * 思路：wasm 内存文件系统写入每份明文库 → ATTACH ... KEY '' 挂接明文库 →
+   * 按启发式列映射导入 NTUser/NTChatRoom/NTChatMessage 统一表 →
+   * 导出统一库字节后复用现有 open() 流程，上层 UI 零改动。
+   *
+   * @param {Array<{name:string, chatId:?string, data:Uint8Array}>} edbs
+   * @param {string} key SQLCipher 密钥（hex 字符串）
+   * @param {?number} myId 当前登录用户 ID（可选，写入 NTChatContext）
+   * @param {Function} [onProgress] (stage, detail)
+   */
+  async openUnifiedWindows(edbs, key, myId = null, onProgress) {
+    const report = (stage, detail) => onProgress && onProgress(stage, detail);
+    const qid = (s) => '"' + String(s).replace(/"/g, '""') + '"';
+    const qlit = (v) => (v == null ? 'NULL' : "'" + String(v).replace(/'/g, "''") + "'");
+
+    report('wasm', '加载 SQLCipher WebAssembly 模块…');
+    this.module = await getModule();
+    this.api = new SQLiteAPI(this.module);
+    const FS = this.module.FS;
+
+    // 写入明文库到 wasm 内存文件系统
+    report('write', `写入 ${edbs.length} 份明文库…`);
+    const plains = [];
+    edbs.forEach((edb, i) => {
+      if (!edb.data || edb.data.byteLength === 0) return;
+      const p = `/edb-plain-${i}.db`;
+      FS.writeFile(p, edb.data);
+      plains.push({ path: p, edb });
+    });
+
+    // 构建统一结构库（列名对齐 mac 端动态列探测候选）
+    report('build', '构建统一查询库…');
+    const U = '/unified.db';
+    try { FS.unlink(U); } catch { /* 不存在则忽略 */ }
+    const udb = this.api.open(U);
+    udb.setKey(key);
+    udb.exec(`
+      CREATE TABLE NTUser (userId INTEGER PRIMARY KEY, displayName TEXT, nickName TEXT, friendNickName TEXT, accountId TEXT, linkId INTEGER DEFAULT 0);
+      CREATE TABLE NTChatRoom (chatId INTEGER PRIMARY KEY, type INTEGER DEFAULT 2, chatName TEXT, activeMembersCount INTEGER, lastLogId INTEGER, lastUpdatedAt INTEGER, countOfNewMessage INTEGER DEFAULT 0, directChatMemberUserId INTEGER);
+      CREATE TABLE NTChatMessage (logId INTEGER PRIMARY KEY AUTOINCREMENT, chatId INTEGER, authorId INTEGER, message TEXT, attachment TEXT, type INTEGER, sentAt INTEGER);
+      CREATE TABLE NTChatContext (userId INTEGER);
+    `);
+
+    let msgCount = 0;
+    let userCount = 0;
+    for (const { path: p, edb } of plains) {
+      report('ingest', `导入 ${edb.name}…`);
+      udb.exec(`ATTACH DATABASE '${p}' AS src KEY '';`);
+      try {
+        const srcTables = udb
+          .query("SELECT name FROM src.sqlite_master WHERE type='table'")
+          .map((r) => r.name);
+
+        // ---- 消息表（chatLogs_{chatId}.edb 的主体）----
+        const logTable = srcTables.find((t) => /chatlog/i.test(t));
+        if (logTable) {
+          const cols = udb.query(`PRAGMA src.table_info(${qid(logTable)})`).map((r) => r.name);
+          const pick = (cands) => {
+            const hit = cands.find((c) => cols.some((x) => x.toLowerCase() === c.toLowerCase()));
+            return hit ? 's.' + qid(hit) : 'NULL';
+          };
+          const chatId = edb.chatId ? Number(edb.chatId) : null;
+          udb.exec(`
+            INSERT INTO NTChatMessage (chatId, authorId, message, type, sentAt)
+            SELECT ${chatId == null ? 'NULL' : Number(chatId)},
+                   ${pick(['authorId', 'from', 'senderId', 'userId'])},
+                   ${pick(['message', 'msg', 'content', 'text'])},
+                   ${pick(['type', 'msgType', 'messageType'])},
+                   ${pick(['sendAt', 'time', 'timestamp', 'createdAt', 'date'])}
+            FROM src.${qid(logTable)} s
+          `);
+          const stat = udb.query(`SELECT count(*) AS c FROM src.${qid(logTable)}`)[0];
+          msgCount += Number(stat.c);
+          if (chatId != null) {
+            const agg = udb.query(`
+              SELECT max(${pick(['_id', 'id', 'msgId', 'logId']).replace(/^s\./, 's.')}) AS lastLogId,
+                     max(${pick(['sendAt', 'time', 'timestamp', 'createdAt', 'date'])}) AS lastAt,
+                     count(DISTINCT ${pick(['authorId', 'from', 'senderId', 'userId'])}) AS members
+              FROM src.${qid(logTable)} s
+            `)[0] || {};
+            udb.exec(`
+              INSERT INTO NTChatRoom (chatId, type, chatName, activeMembersCount, lastLogId, lastUpdatedAt)
+              VALUES (${Number(chatId)}, 0, ${qlit('聊天室 ' + chatId)},
+                      ${agg.members == null ? 'NULL' : Number(agg.members)},
+                      ${agg.lastLogId == null ? 'NULL' : Number(agg.lastLogId)},
+                      ${agg.lastAt == null ? 'NULL' : Number(agg.lastAt)})
+              ON CONFLICT(chatId) DO UPDATE SET
+                lastLogId = COALESCE(excluded.lastLogId, lastLogId),
+                lastUpdatedAt = COALESCE(excluded.lastUpdatedAt, lastUpdatedAt),
+                activeMembersCount = COALESCE(excluded.activeMembersCount, activeMembersCount)
+            `);
+          }
+        }
+
+        // ---- 用户表（TalkUserDB.edb 的 talkUser）----
+        const userTable = srcTables.find((t) => /talkuser|^user/i.test(t) && !/chatlog/i.test(t));
+        if (userTable) {
+          const cols = udb.query(`PRAGMA src.table_info(${qid(userTable)})`).map((r) => r.name);
+          const pick = (cands) => {
+            const hit = cands.find((c) => cols.some((x) => x.toLowerCase() === c.toLowerCase()));
+            return hit ? 's.' + qid(hit) : 'NULL';
+          };
+          const uidCol = ['userId', 'user_id', 'userid', 'id'].find((c) =>
+            cols.some((x) => x.toLowerCase() === c.toLowerCase())
+          );
+          if (uidCol) {
+            udb.exec(`
+              INSERT OR IGNORE INTO NTUser (userId, displayName, nickName, friendNickName)
+              SELECT DISTINCT s.${qid(uidCol)},
+                     ${pick(['nickName', 'nickname', 'displayName', 'name'])},
+                     ${pick(['nickName', 'nickname'])},
+                     ${pick(['friendNickName', 'friendNickname'])}
+              FROM src.${qid(userTable)} s
+              WHERE s.${qid(uidCol)} IS NOT NULL
+            `);
+          }
+        }
+
+        // ---- 房间列表（chatListInfo.edb / TalkUserDB 内的 chatList）----
+        const listTable = srcTables.find((t) => /chatlist|chat_list/i.test(t));
+        if (listTable) {
+          const cols = udb.query(`PRAGMA src.table_info(${qid(listTable)})`).map((r) => r.name);
+          const pick = (cands) => {
+            const hit = cands.find((c) => cols.some((x) => x.toLowerCase() === c.toLowerCase()));
+            return hit ? 's.' + qid(hit) : 'NULL';
+          };
+          const idCol = ['chatId', 'id', 'roomId'].find((c) =>
+            cols.some((x) => x.toLowerCase() === c.toLowerCase())
+          );
+          if (idCol) {
+            udb.exec(`
+              INSERT INTO NTChatRoom (chatId, type, chatName)
+              SELECT s.${qid(idCol)}, 2, ${pick(['name', 'title', 'roomName'])}
+              FROM src.${qid(listTable)} s
+              WHERE s.${qid(idCol)} IS NOT NULL
+              ON CONFLICT(chatId) DO UPDATE SET
+                chatName = COALESCE(excluded.chatName, chatName),
+                type = COALESCE(excluded.type, type)
+            `);
+          }
+        }
+      } finally {
+        udb.exec('DETACH DATABASE src;');
+      }
+    }
+
+    userCount = Number(
+      (udb.query('SELECT count(*) AS c FROM NTUser')[0] || { c: 0 }).c
+    );
+    if (myId != null) {
+      udb.exec(`INSERT INTO NTChatContext (userId) VALUES (${Number(myId)})`);
+    }
+    udb.close();
+
+    const unified = FS.readFile(U);
+    for (const { path: p } of plains) { try { FS.unlink(p); } catch { /* 忽略 */ } }
+    try { FS.unlink(U); } catch { /* 忽略 */ }
+
+    report('done', `统一库构建完成：${msgCount} 条消息 / ${userCount} 位联系人`);
+    return await this.open({ data: unified, key, onProgress });
+  }
+
   /** 获取所有表名 */
   tableNames() {
     const res = this.raw("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
