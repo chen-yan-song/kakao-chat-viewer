@@ -12,3 +12,4 @@ __pycache__/
 node_modules/
 release/
 build/icon.iconset/
+.tmp-test/
