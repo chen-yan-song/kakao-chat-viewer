@@ -141,12 +141,13 @@ export class KakaoDB {
   /**
    * 打开并解密数据库
    * @param {Object} opts
-   * @param {File} opts.file 数据库文件
-   * @param {File[]} [opts.sideFiles] 可选的 -wal/-shm 伴随文件
+   * @param {Uint8Array} opts.data 数据库文件原始字节
+   * @param {Uint8Array[]} [opts.sideDatas] 可选的 -wal/-shm 伴随文件字节
+   * @param {string} [opts.sideSuffixes] 与 sideDatas 对应的后缀名（如 '-wal'）
    * @param {string} opts.key SQLCipher 密钥（hex 字符串）
    * @param {Function} [opts.onProgress] 进度回调 (stage, detail)
    */
-  async open({ file, sideFiles = [], key, onProgress }) {
+  async open({ data, sideDatas = [], sideSuffixes = [], key, onProgress }) {
     const report = (stage, detail) => onProgress && onProgress(stage, detail);
 
     report('wasm', '加载 SQLCipher WebAssembly 模块…');
@@ -154,11 +155,12 @@ export class KakaoDB {
     this.api = new SQLiteAPI(this.module);
 
     // 将数据库文件写入 Emscripten 内存文件系统（MEMFS）
-    report('write', `写入数据库文件（${(file.size / 1024 / 1024).toFixed(1)} MB）…`);
-    this.module.FS.writeFile(DB_PATH, new Uint8Array(await file.arrayBuffer()));
-    for (const side of sideFiles) {
-      if (side && side.size > 0) {
-        this.module.FS.writeFile(DB_PATH + suffixOf(side.name), new Uint8Array(await side.arrayBuffer()));
+    report('write', `写入数据库文件（${(data.byteLength / 1024 / 1024).toFixed(1)} MB）…`);
+    this.module.FS.writeFile(DB_PATH, data);
+    for (let i = 0; i < sideDatas.length; i++) {
+      const bytes = sideDatas[i];
+      if (bytes && bytes.byteLength > 0) {
+        this.module.FS.writeFile(DB_PATH + (sideSuffixes[i] || ''), bytes);
       }
     }
 
@@ -476,6 +478,43 @@ export class KakaoDB {
     return out;
   }
 
+  /**
+   * 通用数据表查询：任意表的全部数据（分页 + 可选关键字过滤）
+   * @param {string} tableName 表名（必须在当前数据库中存在）
+   * @param {{offset?: number, limit?: number, keyword?: string}} opts
+   * @returns {{columns: string[], rows: Array<Object>, total: number}}
+   */
+  queryTable(tableName, { offset = 0, limit = 100, keyword = '' } = {}) {
+    this._ensureOpen();
+    // 表名白名单校验（防拼接注入）
+    if (!this.tableNames().includes(tableName)) {
+      throw new Error('表不存在: ' + tableName);
+    }
+    const safeTable = `"${tableName.replace(/"/g, '""')}"`;
+
+    const cols = [...this.tableColumns(tableName)];
+    let where = '';
+    let likeParams = [];
+    if (keyword) {
+      // 对所有列做 CAST AS TEXT LIKE（兼容数字列与文本列）
+      const kw = `%${keyword}%`;
+      const exprs = cols.map((c) => `CAST("${c.replace(/"/g, '""')}" AS TEXT) LIKE ?`);
+      if (exprs.length) {
+        where = 'WHERE ' + exprs.join(' OR ');
+        likeParams = cols.map(() => kw);
+      }
+    }
+
+    const total = Number(
+      this.raw(`SELECT COUNT(*) AS c FROM ${safeTable} ${where}`, likeParams).rows[0].c
+    );
+    const res = this.raw(
+      `SELECT * FROM ${safeTable} ${where} ORDER BY rowid LIMIT ? OFFSET ?`.trim(),
+      [...likeParams, limit, offset]
+    );
+    return { columns: res.columns, rows: res.rows, total };
+  }
+
   _ensureOpen() {
     if (!this.db) throw new Error('数据库尚未打开');
   }
@@ -496,3 +535,5 @@ function suffixOf(name) {
   if (name.endsWith('-journal')) return '-journal';
   return '';
 }
+
+export { suffixOf };

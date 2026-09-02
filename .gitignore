@@ -7,3 +7,8 @@
 # Python 缓存
 __pycache__/
 *.pyc
+
+# Electron / 构建
+node_modules/
+release/
+build/icon.iconset/

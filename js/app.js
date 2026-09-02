@@ -1,10 +1,12 @@
 /**
- * KakaoChat Viewer 交互逻辑
+ * KakaoChat Viewer 交互逻辑（Mac App / 浏览器双模式）
  *
- * 流程：输入 UUID / 提取 userId → 选择加密数据库 → WASM 解密 → 聊天室列表 → 消息查看
- * 所有处理均在浏览器本地内存完成。
+ * Mac App：启动即运行全自动流程（UUID → plist → userId → 数据库 → 解密），
+ *          失败时自动提供手动兜底；导出走系统对话框。
+ * 浏览器：保留原三步手动配置流程。
+ * 所有处理均在本地内存完成。
  */
-import { KakaoDB } from './kakaoDb.js';
+import { KakaoDB, suffixOf } from './kakaoDb.js';
 import { deriveSecureKey, deriveDatabaseName, isValidUUID } from './keyDerivation.js';
 import {
   parseMessage,
@@ -18,10 +20,18 @@ import {
   bruteUserIdFromHash,
   verifyUserIdHash,
 } from './plistParser.js';
+import { registerAuto, runAutoFlow, inElectron } from './autoFlow.js';
 
 // ============ DOM 引用 ============
 const $ = (id) => document.getElementById(id);
 const el = {
+  // 自动流程
+  autoPanel: $('autoPanel'),
+  autoSteps: $('autoSteps'),
+  autoMsg: $('autoMsg'),
+  autoRetryBtn: $('autoRetryBtn'),
+  autoManualBtn: $('autoManualBtn'),
+  // 手动配置
   uuidInput: $('uuidInput'),
   userIdInput: $('userIdInput'),
   plistDrop: $('plistDrop'),
@@ -54,10 +64,23 @@ const el = {
   chatSearch: $('chatSearch'),
   searchBtn: $('searchBtn'),
   statsBar: $('statsBar'),
+  dataBtn: $('dataBtn'),
+  dataModal: $('dataModal'),
+  dataClose: $('dataClose'),
+  dataTabs: $('dataTabs'),
+  dataFilter: $('dataFilter'),
+  dataPageInfo: $('dataPageInfo'),
+  dataPrevBtn: $('dataPrevBtn'),
+  dataNextBtn: $('dataNextBtn'),
+  dataGridHead: $('dataGridHead'),
+  dataGridBody: $('dataGridBody'),
+  dataEmpty: $('dataEmpty'),
   chatList: $('chatList'),
   chatTitle: $('chatTitle'),
   chatMeta: $('chatMeta'),
   exportBtn: $('exportBtn'),
+  exportTxtBtn: $('exportTxtBtn'),
+  exportAllBtn: $('exportAllBtn'),
   msgList: $('msgList'),
   msgEmpty: $('msgEmpty'),
   loadMoreBtn: $('loadMoreBtn'),
@@ -83,6 +106,8 @@ const state = {
   loadingMore: false,
   myId: null,
   searchMode: false,
+  // 数据表浏览模态框
+  dataView: { table: null, offset: 0, keyword: '', total: 0 },
 };
 
 // ============ 工具函数 ============
@@ -402,11 +427,21 @@ function fileRow(name, size, tag, file, tagCls = '') {
 }
 
 // ============ 打开数据库 ============
+/** 读取文件对象字节：优先 App 桥接读盘，其次浏览器 File */
+async function loadFileData(f) {
+  if (f.path && window.kakaoApp) {
+    const buf = await window.kakaoApp.readDbFile(f.path);
+    return new Uint8Array(buf);
+  }
+  if (f.file) return new Uint8Array(await f.file.arrayBuffer());
+  throw new Error('无法读取文件数据：' + (f.name || '未知文件'));
+}
+
 async function openDatabase() {
   clearError();
   const uuid = el.uuidInput.value.trim();
   const userId = validUserId();
-  if (!isValidUUID(uuid) || userId === null || !state.mainFile) return;
+  if (!isValidUUID(uuid) || userId === null || !state.mainFile) return false;
 
   // 解密前再按派生文件名校验一次主库选择，避免误选同目录的旧库
   await matchMainByDerivedName();
@@ -423,10 +458,21 @@ async function openDatabase() {
     const key = await deriveSecureKey(userId, uuid);
     el.progressText.textContent = '密钥派生完成，加载 SQLCipher WASM 并解密数据库…';
 
+    const data = await loadFileData(state.mainFile);
+    const sideDatas = [];
+    const sideSuffixes = [];
+    for (const s of state.sideFiles) {
+      try {
+        sideDatas.push(await loadFileData(s));
+        sideSuffixes.push(suffixOf(s.name));
+      } catch { /* 伴随文件读取失败不阻塞主库解密 */ }
+    }
+
     const db = new KakaoDB();
     await db.open({
-      file: state.mainFile,
-      sideFiles: state.sideFiles,
+      data,
+      sideDatas,
+      sideSuffixes,
       key,
       onProgress: (stage, detail) => {
         if (stage === 'wasm' || stage === 'write' || stage === 'decrypt') {
@@ -442,12 +488,14 @@ async function openDatabase() {
     state.db = db;
     state.myId = db.myUserId() ?? userId;
     await enterViewer();
+    return true;
   } catch (e) {
     el.progressBar.className = 'progress-bar';
     el.progressBar.style.width = '0%';
     el.progressArea.hidden = true;
     showError('解密失败：' + e.message);
     el.openBtn.disabled = false;
+    return false;
   }
 }
 
@@ -464,6 +512,7 @@ async function enterViewer() {
   if (stats.messageCount != null) parts.push(`${stats.messageCount.toLocaleString()} 条消息`);
   if (stats.userCount != null) parts.push(`${stats.userCount} 位用户`);
   el.statsBar.textContent = parts.join(' · ') + ` · 当前账号 ID ${state.myId ?? '未知'}`;
+  el.dataBtn.hidden = false;
 
   // 先自动诊断（表结构异常时列表加载可能报错，诊断需在之前执行）
   runDiagnose(db, stats);
@@ -626,6 +675,8 @@ async function openChat(chat) {
     .filter(Boolean)
     .join(' · ');
   el.exportBtn.hidden = false;
+  el.exportTxtBtn.hidden = false;
+  el.exportAllBtn.hidden = false;
 
   el.msgList.innerHTML = '';
   el.msgEmpty.textContent = '加载中…';
@@ -867,25 +918,306 @@ async function doSearch() {
   }
 }
 
+// ============ 数据表浏览器 ============
+const DATA_PAGE_SIZE = 100;
+
+/** 打开数据表浏览模态框（默认展示行数最多的表） */
+function openDataBrowser() {
+  if (!state.db) return;
+  let tables;
+  try {
+    tables = state.db.diagnose().tables; // [{name, count}]
+  } catch (e) {
+    showError('读取表列表失败：' + e.message);
+    return;
+  }
+  renderDataTabs(tables);
+  const busiest = tables
+    .filter((t) => (t.count ?? 0) > 0)
+    .sort((a, b) => b.count - a.count)[0];
+  state.dataView.table = busiest ? busiest.name : tables[0]?.name || null;
+  state.dataView.offset = 0;
+  state.dataView.keyword = '';
+  el.dataFilter.value = '';
+  el.dataEmpty.hidden = true;
+  el.dataModal.hidden = false;
+  loadDataTable();
+}
+
+/** 渲染表切换 chips（含行数） */
+function renderDataTabs(tables) {
+  el.dataTabs.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  for (const t of tables) {
+    const chip = document.createElement('button');
+    chip.className = 'data-chip';
+    chip.dataset.table = t.name;
+    chip.textContent = `${t.name} (${t.count == null ? '?' : t.count.toLocaleString()})`;
+    frag.appendChild(chip);
+  }
+  el.dataTabs.appendChild(frag);
+}
+
+/** 加载并渲染当前表的数据（分页） */
+function loadDataTable() {
+  const view = state.dataView;
+  if (!view.table) {
+    el.dataGridHead.innerHTML = '';
+    el.dataGridBody.innerHTML = '';
+    el.dataPageInfo.textContent = '';
+    el.dataEmpty.hidden = false;
+    el.dataEmpty.textContent = '数据库中没有表';
+    return;
+  }
+  for (const chip of el.dataTabs.children) {
+    chip.classList.toggle('active', chip.dataset.table === view.table);
+  }
+  try {
+    const { columns, rows, total } = state.db.queryTable(view.table, {
+      offset: view.offset,
+      limit: DATA_PAGE_SIZE,
+      keyword: view.keyword,
+    });
+    view.total = total;
+
+    el.dataGridHead.innerHTML = '';
+    const htr = document.createElement('tr');
+    for (const c of columns) {
+      const th = document.createElement('th');
+      th.textContent = c;
+      htr.appendChild(th);
+    }
+    el.dataGridHead.appendChild(htr);
+
+    el.dataGridBody.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    for (const row of rows) {
+      const tr = document.createElement('tr');
+      for (const c of columns) {
+        const td = document.createElement('td');
+        applyCell(td, row[c]);
+        tr.appendChild(td);
+      }
+      frag.appendChild(tr);
+    }
+    el.dataGridBody.appendChild(frag);
+
+    const page = Math.floor(view.offset / DATA_PAGE_SIZE) + 1;
+    const pageCount = Math.max(1, Math.ceil(total / DATA_PAGE_SIZE));
+    el.dataPageInfo.textContent = `第 ${page}/${pageCount} 页 · 共 ${total.toLocaleString()} 行`;
+    el.dataPrevBtn.disabled = view.offset <= 0;
+    el.dataNextBtn.disabled = view.offset + DATA_PAGE_SIZE >= total;
+    el.dataEmpty.hidden = rows.length > 0;
+    el.dataEmpty.textContent = view.keyword
+      ? '当前表无匹配行'
+      : '该表没有数据';
+  } catch (e) {
+    el.dataGridHead.innerHTML = '';
+    el.dataGridBody.innerHTML = '';
+    el.dataPageInfo.textContent = '';
+    el.dataEmpty.hidden = false;
+    el.dataEmpty.textContent = '查询失败：' + e.message;
+  }
+}
+
+/** 单元格展示：NULL / BLOB / BigInt / 超长文本的处理 */
+function applyCell(td, v) {
+  if (v === null || v === undefined) {
+    td.textContent = '';
+    td.classList.add('cell-null');
+    return;
+  }
+  if (v instanceof Uint8Array) {
+    td.textContent = `[BLOB ${v.length} 字节]`;
+    td.classList.add('cell-blob');
+    td.title = '二进制数据（前 64 字节 hex）：' +
+      [...v.slice(0, 64)].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+    return;
+  }
+  const s = typeof v === 'bigint' ? v.toString() : String(v);
+  td.textContent = s;
+  if (s.length > 60) td.title = s; // 完整内容悬停可见
+}
+
 // ============ 导出 ============
-function exportChat() {
-  if (!state.activeChat || state.messages.length === 0) return;
-  const chat = {
-    chatId: state.activeChat.chatId,
-    chatName: chatDisplayName(state.activeChat),
-    type: state.activeChat.type,
-    memberCount: state.activeChat.memberCount,
+/** 当前聊天室展示名 */
+function activeChatInfo() {
+  const chat = state.activeChat;
+  return {
+    chatId: chat.chatId,
+    chatName: chatDisplayName(chat),
+    type: chat.type,
+    memberCount: chat.memberCount,
   };
+}
+
+/** 清理文件名中的非法字符 */
+function sanitizeFileName(name) {
+  return String(name).replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 80) || '未命名';
+}
+
+/** 导出当前聊天为 JSON（App 内走系统对话框，浏览器走下载） */
+async function exportChat() {
+  if (!state.activeChat || state.messages.length === 0) return;
+  const chat = activeChatInfo();
   // 导出为时间正序
   const ordered = state.messages.slice().reverse();
   const json = serializeExport(chat, ordered);
+  const defaultName = `kakao-chat-${sanitizeFileName(chat.chatName)}-${chat.chatId}.json`;
+
+  if (window.kakaoApp) {
+    const res = await window.kakaoApp.saveText(defaultName, json);
+    if (res.saved) {
+      el.progressText.textContent = '';
+      el.chatMeta.textContent = `已导出到 ${res.path}`;
+      if (res.path) window.kakaoApp.showInFolder(res.path);
+    }
+    return;
+  }
+  // 浏览器回退
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `kakao-chat-${chat.chatId}-${Date.now()}.json`;
+  a.download = defaultName;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/** 将消息数组序列化为可读 TXT（时间正序） */
+function serializeExportTxt(chat, messages) {
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const fmt = (ts) => {
+    const t = normTs(ts);
+    if (t === null || !Number.isFinite(t)) return '未知时间';
+    const d = new Date(t * 1000);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  };
+  const typeLabel = (m) => {
+    const parsed = parseMessage(m.message, m.type, m.attachment);
+    if (parsed.text) return parsed.text;
+    return `[${messageTypeInfo(m.type).label}]`;
+  };
+  const lines = [];
+  lines.push('========================================');
+  lines.push(`KakaoTalk 聊天记录导出`);
+  lines.push(`聊天室：${chat.chatName}`);
+  lines.push(`类型：${chat.type === 1 ? '私聊' : '群聊'}${chat.memberCount != null ? `（${chat.memberCount} 人）` : ''}`);
+  lines.push(`聊天室 ID：${chat.chatId}`);
+  lines.push(`消息数：${messages.length}`);
+  lines.push(`导出时间：${fmt(Date.now() / 1000)}`);
+  lines.push('========================================');
+  lines.push('');
+  for (const m of messages) {
+    const isSystem = m.type === 0 || m.authorId === 0;
+    const name = isSystem ? '系统' : (m.senderName || (m.authorId != null ? String(m.authorId) : '未知'));
+    const mine = state.myId !== null && m.authorId === state.myId && !isSystem;
+    const who = mine ? `${name}（我）` : name;
+    lines.push(`[${fmt(m.sentAt)}] ${who}: ${typeLabel(m)}`);
+  }
+  return lines.join('\n');
+}
+
+/** 导出当前聊天为 TXT */
+async function exportChatTxt() {
+  if (!state.activeChat || state.messages.length === 0) return;
+  const chat = activeChatInfo();
+  const ordered = state.messages.slice().reverse();
+  const txt = serializeExportTxt(chat, ordered);
+  const defaultName = `kakao-chat-${sanitizeFileName(chat.chatName)}-${chat.chatId}.txt`;
+
+  if (window.kakaoApp) {
+    const res = await window.kakaoApp.saveText(defaultName, txt);
+    if (res.saved) {
+      el.chatMeta.textContent = `已导出到 ${res.path}`;
+      if (res.path) window.kakaoApp.showInFolder(res.path);
+    }
+    return;
+  }
+  const blob = new Blob([txt], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = defaultName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** 拉取某个聊天室的全部消息（时间正序） */
+function fetchAllMessages(chatId) {
+  const all = [];
+  let offset = 0;
+  while (true) {
+    const { rows, hasMore } = state.db.getMessages(chatId, { offset, limit: 5000 });
+    all.push(...rows);
+    if (!hasMore || rows.length === 0) break;
+    offset += rows.length;
+    if (offset > 2_000_000) break; // 防御性上限
+  }
+  return all.reverse();
+}
+
+/** 一键导出全部聊天记录：选一个文件夹，写入每个聊天室的 JSON + TXT */
+async function exportAllChats() {
+  if (!state.db || state.chats.length === 0) return;
+  const btn = el.exportAllBtn;
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  const files = [];
+  const used = new Set();
+  try {
+    for (let i = 0; i < state.chats.length; i++) {
+      const chat = state.chats[i];
+      btn.textContent = `导出中 ${i + 1}/${state.chats.length}…`;
+      await new Promise((r) => setTimeout(r, 0)); // 让 UI 刷新
+
+      const chatInfo = {
+        chatId: chat.chatId,
+        chatName: chatDisplayName(chat),
+        type: chat.type,
+        memberCount: chat.memberCount,
+      };
+      const ordered = fetchAllMessages(chat.chatId);
+      if (ordered.length === 0) continue; // 空聊天室不导出
+
+      let base = `${String(i + 1).padStart(3, '0')}-${sanitizeFileName(chatInfo.chatName)}`;
+      while (used.has(base)) base += '_' + chat.chatId;
+      used.add(base);
+      files.push({ name: `${base}.json`, content: serializeExport(chatInfo, ordered) });
+      files.push({ name: `${base}.txt`, content: serializeExportTxt(chatInfo, ordered) });
+    }
+    // 汇总清单
+    const summary = {
+      exportedAt: new Date().toISOString(),
+      account: { userId: state.myId, deviceUuid: state.uuid },
+      totalChats: state.chats.length,
+      exportedChats: files.length / 2,
+      chats: state.chats.map((c, idx) => ({
+        index: idx + 1,
+        chatId: c.chatId,
+        name: chatDisplayName(c),
+        type: c.type === 1 ? 'private' : 'group',
+        memberCount: c.memberCount,
+        lastUpdatedAt: c.lastUpdatedAt,
+      })),
+    };
+    files.push({ name: '_summary.json', content: JSON.stringify(summary, null, 2) });
+
+    const res = await window.kakaoApp.exportAll(files);
+    if (res.saved) {
+      btn.textContent = `已导出 ${res.count} 个文件`;
+      el.chatMeta.textContent = `全部聊天记录已导出到 ${res.dir}`;
+      if (res.dir) window.kakaoApp.showInFolder(res.dir);
+      setTimeout(() => { btn.textContent = originalText; }, 4000);
+    } else {
+      btn.textContent = originalText;
+    }
+  } catch (e) {
+    showError('导出失败：' + e.message);
+    btn.textContent = originalText;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ============ 事件绑定 ============
@@ -898,6 +1230,8 @@ function bindEvents() {
   });
   el.loadMoreBtn.addEventListener('click', loadMore);
   el.exportBtn.addEventListener('click', exportChat);
+  el.exportTxtBtn.addEventListener('click', exportChatTxt);
+  el.exportAllBtn.addEventListener('click', exportAllChats);
   el.searchBtn.addEventListener('click', doSearch);
   el.chatSearch.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') doSearch();
@@ -906,11 +1240,123 @@ function bindEvents() {
     // 清空输入即退出搜索
     if (el.chatSearch.value.trim() === '' && state.searchMode) doSearch();
   });
+  el.autoManualBtn.addEventListener('click', showManualMode);
+  el.autoRetryBtn.addEventListener('click', retryAutoFlow);
+
+  // 数据表浏览器
+  el.dataBtn.addEventListener('click', openDataBrowser);
+  el.dataClose.addEventListener('click', () => { el.dataModal.hidden = true; });
+  el.dataModal.addEventListener('click', (e) => {
+    if (e.target === el.dataModal) el.dataModal.hidden = true; // 点遮罩关闭
+  });
+  el.dataTabs.addEventListener('click', (e) => {
+    const chip = e.target.closest('.data-chip');
+    if (!chip || chip.dataset.table === state.dataView.table) return;
+    state.dataView.table = chip.dataset.table;
+    state.dataView.offset = 0;
+    loadDataTable();
+  });
+  el.dataFilter.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    state.dataView.keyword = el.dataFilter.value.trim();
+    state.dataView.offset = 0;
+    loadDataTable();
+  });
+  el.dataPrevBtn.addEventListener('click', () => {
+    state.dataView.offset = Math.max(0, state.dataView.offset - DATA_PAGE_SIZE);
+    loadDataTable();
+  });
+  el.dataNextBtn.addEventListener('click', () => {
+    state.dataView.offset += DATA_PAGE_SIZE;
+    loadDataTable();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !el.dataModal.hidden) el.dataModal.hidden = true;
+  });
 
   setupPlistDrop();
   setupBruteForce();
   setupDbDrop();
 }
 
+// ============ 自动流程（Mac App 模式） ============
+/** 重置自动流程步骤 UI */
+function resetAutoSteps() {
+  for (const li of el.autoSteps.querySelectorAll('li[data-step]')) {
+    li.className = 'auto-step';
+    const d = li.querySelector('.step-detail');
+    if (d) d.textContent = '';
+  }
+  el.autoMsg.hidden = true;
+  el.autoMsg.textContent = '';
+  el.autoRetryBtn.hidden = true;
+  el.autoPanel.hidden = false;
+  el.autoPanel.querySelector('.auto-progress').hidden = false;
+}
+
+/** 更新某个步骤的状态与说明 */
+function setAutoStep(name, status, detail) {
+  const li = el.autoSteps.querySelector(`li[data-step="${name}"]`);
+  if (!li) return;
+  li.className = 'auto-step ' + status;
+  const d = li.querySelector('.step-detail');
+  if (d) d.textContent = detail || '';
+}
+
+/** 显示自动流程下的提示信息 */
+function showAutoMsg(msg) {
+  el.autoMsg.textContent = msg;
+  el.autoMsg.hidden = false;
+}
+
+/** 把自动发现结果写入 state（复用手动模式的主库匹配/渲染逻辑） */
+function applyDiscovery({ uuid, userId, mains, sides }) {
+  el.uuidInput.value = uuid;
+  el.userIdInput.value = String(userId);
+  state.mainCandidates = mains.slice().sort((a, b) => b.size - a.size);
+  state.mainFile = state.mainCandidates[0];
+  state.sideFiles = sides;
+  state.mainMatchedByName = false;
+}
+
+/** 切到手动模式：隐藏自动面板，展开原配置区 */
+function showManualMode() {
+  el.autoPanel.hidden = true;
+  el.setup.hidden = false;
+  refreshOpenBtn();
+}
+
+/** 重新跑一次全自动流程 */
+async function retryAutoFlow() {
+  resetAutoSteps();
+  el.setup.hidden = true;
+  await runAutoFlow();
+}
+
+// 自动流程依赖注入
+registerAuto({
+  state,
+  setStep: setAutoStep,
+  applyDiscovery,
+  tryOpenDatabase: openDatabase,
+  autoMsg: showAutoMsg,
+});
+
+/** 启动入口：App 内自动流程，浏览器手动模式 */
+async function boot() {
+  if (inElectron()) {
+    resetAutoSteps();
+    el.setup.hidden = true;
+    const ok = await runAutoFlow();
+    if (!ok) {
+      el.autoRetryBtn.hidden = false;
+      el.autoPanel.querySelector('.auto-progress').hidden = true;
+    }
+  } else {
+    showManualMode();
+  }
+}
+
 bindEvents();
 refreshOpenBtn();
+boot();
