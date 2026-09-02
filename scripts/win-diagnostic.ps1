@@ -271,7 +271,11 @@ if ($edbs.Count -eq 0) {
 } elseif ($materials.Count -eq 0) {
   Out-Line 'No material variants. Send this output back (registry section above is critical).'
 } else {
-  $probe = $edbs | Where-Object { $_.Name -match '(?i)^chatLogs' } | Select-Object -First 1
+  # 探针优先级：TalkUserDB > chatListInfo > 最大 chatLogs > 最小可用库（与 app 内 SQLCipher 探针对齐）
+  $probe = $edbs | Where-Object { $_.Name -match '(?i)^TalkUserDB\.edb$' } | Select-Object -First 1
+  if (-not $probe) { $probe = $edbs | Where-Object { $_.Name -match '(?i)^chatListInfo\.edb$' } | Select-Object -First 1 }
+  if (-not $probe) { $probe = $edbs | Where-Object { $_.Name -match '(?i)^chatLogs' -and $_.Length -ge 4096 } | Sort-Object Length -Descending | Select-Object -First 1 }
+  if (-not $probe) { $probe = $edbs | Where-Object { $_.Length -ge 4096 } | Sort-Object Length | Select-Object -First 1 }
   if (-not $probe) { $probe = $edbs | Select-Object -First 1 }
   $edbBytes = $null
   try { $edbBytes = [System.IO.File]::ReadAllBytes($probe.FullName) } catch {}
@@ -318,7 +322,8 @@ if ($edbs.Count -eq 0) {
   } else {
     Out-Line 'NOT FOUND with legacy algorithm.'
     Out-Line 'Interpretation hint: if the first 32 bytes look random (no plain-text header), the EDB is likely SQLCipher 4 encrypted -'
-    Out-Line 'use the app (new build) with KakaoTalk running: it will auto-recover the raw key from process memory.'
+    Out-Line 'use the app (new build) with KakaoTalk running: it recovers raw keys from process memory via hex scan AND binary window scan (AES filter + HMAC-SHA512 verification).'
+    Out-Line 'Make sure you opened the chat list / a chat window in KakaoTalk before clicking auto-fetch (keys are only in memory for loaded DBs).'
     Out-Line 'Send this whole output back anyway - the registry section and first-32-bytes are the key clues.'
   }
   }

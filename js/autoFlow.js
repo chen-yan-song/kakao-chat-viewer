@@ -225,7 +225,8 @@ async function runAutoFlowWindows() {
   }
   const isSqlcipher = dec.params.kind === 'sqlcipher';
   if (isSqlcipher) {
-    setStep('uid', 'ok', 'SQLCipher 密钥已从进程内存恢复（新版加密，无需 userId）');
+    const kc = dec.params.keyCount > 1 ? `（共 ${dec.params.keyCount} 把密钥）` : '';
+    setStep('uid', 'ok', `SQLCipher 密钥已从进程内存恢复${kc}（新版加密，无需 userId）`);
   } else {
     setStep('uid', 'ok', `用户 ID ${dec.params.userId}（已由参数求解验证）`);
   }

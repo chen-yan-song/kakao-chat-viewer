@@ -298,7 +298,7 @@ function weightedUserId(counts) {
 function writeMemoryDumpScript(tmpDir) {
   const ps1 = path.join(tmpDir, 'kkv-dump.ps1');
   const script = String.raw`
-param([int]$TargetPid, [string]$OutFile)
+param([int]$TargetPid, [string]$OutFile, [switch]$PrivateOnly)
 $sig = @"
 using System;
 using System.Runtime.InteropServices;
@@ -334,6 +334,10 @@ while ($true) {
   if ($ret -eq [IntPtr]::Zero) { break }
   $region = [int64]$mbi.RegionSize
   if ($mbi.State -eq 0x1000 -and $region -gt 0 -and $region -le 268435456) {
+    # 可读保护位（0x02/0x04/0x08/0x20/0x40/0x80），排除 PAGE_GUARD(0x100)；PrivateOnly 时仅 MEM_PRIVATE(0x20000) 堆内存
+    $protOk = (($mbi.Protect -band 0xEE) -ne 0) -and (($mbi.Protect -band 0x100) -eq 0)
+    $typeOk = (-not $PrivateOnly) -or ($mbi.Type -eq 0x20000)
+    if ($protOk -and $typeOk) {
     $remain = $region
     $cur = [int64]$mbi.BaseAddress
     while ($remain -gt 0) {
@@ -342,6 +346,7 @@ while ($true) {
       if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read) }
       $cur += $take
       $remain -= $take
+    }
     }
   }
   $addr = [IntPtr]([int64]$mbi.BaseAddress + $region)
@@ -355,17 +360,16 @@ $fs.Close()
 
 /**
  * dump 指定进程内存到临时文件（P/Invoke，仅同用户权限）；调用方负责删除 dump 文件
+ * privateOnly=true 时仅导出 MEM_PRIVATE 堆内存（体积小，SQLCipher 密钥扫描用）
  * @returns {Promise<{ok:boolean, dumpPath?:string, reason?:string}>}
  */
-function dumpProcessMemory(pid, timeoutMs = 300000) {
+function dumpProcessMemory(pid, timeoutMs = 300000, { privateOnly = false } = {}) {
   return new Promise((resolve) => {
-    const dumpPath = path.join(os.tmpdir(), `kkv-mem-${pid}.dmp`);
+    const dumpPath = path.join(os.tmpdir(), `kkv-mem-${pid}${privateOnly ? '-p' : ''}.dmp`);
     const ps1 = writeMemoryDumpScript(os.tmpdir());
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-TargetPid', String(pid), '-OutFile', dumpPath],
-      { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] }
-    );
+    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-TargetPid', String(pid), '-OutFile', dumpPath];
+    if (privateOnly) args.push('-PrivateOnly');
+    const child = spawn('powershell.exe', args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     const timer = setTimeout(() => { try { child.kill(); } catch { /* 忽略 */ } }, timeoutMs);
@@ -511,67 +515,285 @@ function decryptSqlCipherEdb(buf, keyBytes, pageSize, hmacSize) {
   return out;
 }
 
+const PGNO1_LE = Buffer.from([1, 0, 0, 0]);
+
 /**
- * SQLCipher 内存密钥恢复路线：dump KakaoTalk 进程 → 扫描 64hex raw key 候选 →
- * 在最小 EDB 页1验证 → 命中后解密全部（新版 KakaoTalk，不依赖设备材料与 userId）
+ * SQLCipher 4 页1 HMAC 精验（对照官方源码 sqlcipher.c，已经 vendor wasm 真库验证）：
+ *   hmac_key = PBKDF2-HMAC-SHA512(cipher_key, 页1盐 ^ 0x3a, iter=2, 32B)
+ *   页1 HMAC = HMAC(hmac_key, page[16 .. pageSize-hmacSize] || pgno_LE(1))（跳过 16 字节盐）
+ * hmacSize=64→SHA512，32→SHA256；0（无 HMAC 变体）不支持精验，返回 false。
+ */
+function verifySqlCipherHmac(edbBuf, keyBytes, pageSize = 4096, hmacSize = 64) {
+  if (hmacSize !== 64 && hmacSize !== 32) return false;
+  if (!Buffer.isBuffer(edbBuf) || edbBuf.length < pageSize) return false;
+  if (!Buffer.isBuffer(keyBytes) || keyBytes.length !== 32) return false;
+  const saltXor = Buffer.alloc(16);
+  for (let i = 0; i < 16; i++) saltXor[i] = edbBuf[i] ^ 0x3a;
+  const hmacKey = crypto.pbkdf2Sync(keyBytes, saltXor, 2, 32, 'sha512');
+  const h = crypto.createHmac(hmacSize === 64 ? 'sha512' : 'sha256', hmacKey);
+  h.update(edbBuf.subarray(16, pageSize - hmacSize));
+  h.update(PGNO1_LE);
+  return h.digest().equals(edbBuf.subarray(pageSize - hmacSize, pageSize));
+}
+
+/** 只读 EDB 头部若干字节（探针用，避免整读大文件） */
+function readEdbHead(edb, bytes) {
+  if (edb.data instanceof ArrayBuffer) return Buffer.from(edb.data).subarray(0, bytes);
+  if (ArrayBuffer.isView(edb.data)) {
+    return Buffer.from(edb.data.buffer, edb.data.byteOffset, edb.data.byteLength).subarray(0, bytes);
+  }
+  const fd = fs.openSync(edb.path, 'r');
+  try {
+    const buf = Buffer.alloc(bytes);
+    const got = fs.readSync(fd, buf, 0, bytes, 0);
+    return got > 0 ? buf.subarray(0, got) : buf.subarray(0, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * SQLCipher 探针选择：优先登录后必然被加载的库（其 key 大概率在内存中）。
+ * 入参按 size 降序；返回最多 max 个。
+ */
+function pickSqlCipherProbes(edbsDesc, max = 3) {
+  const out = [];
+  const push = (e) => { if (e && !out.includes(e)) out.push(e); };
+  const find = (re) => edbsDesc.find((e) => re.test(e.name));
+  push(find(/^TalkUserDB\.edb$/i)); // 登录后常驻
+  push(find(/^chatListInfo\.edb$/i)); // 聊天列表
+  push(find(/^chatLogs[_-]\d+\.edb$/i)); // 降序下第一个 = 最大 chatLogs（最可能被打开过）
+  push(edbsDesc[edbsDesc.length - 1]); // 最小文件兜底
+  return out.slice(0, max).filter((e) => (e.size == null ? true : e.size >= 4096));
+}
+
+/**
+ * 二进制窗口扫描：对 dump 以 32 字节/step 步进窗口做 AES 快速过滤
+ *（解密探针页1首块检查 SQLite 头特征），不依赖 key 在内存中的 hex 文本形态
+ *（KakaoTalk 可能通过 C API 传二进制原始 key）。命中窗口收为候选，由调用方 HMAC 精验。
+ * @param {string} dumpPath 内存 dump 文件
+ * @param {Array<{name:string,buf:Buffer}>} probes 探针页1头部（≥ pageSize）
+ * @returns {{candidates:Array<{keyHex:string,probe:string,pageSize:number,hmacSize:number}>, scanned:number}}
+ */
+function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 64]], maxCandidates = 50000, onProgress } = {}) {
+  const checks = [];
+  for (const p of probes) {
+    for (const [pageSize, hmacSize] of variants) {
+      const ivOff = pageSize - hmacSize - 16;
+      if (!p.buf || p.buf.length < pageSize || ivOff <= 16) continue;
+      checks.push({
+        name: p.name, pageSize, hmacSize,
+        ct: p.buf.subarray(16, 32), // 页1密文首块（盐后 16 字节）
+        iv: p.buf.subarray(ivOff, ivOff + 16),
+        pgHi: pageSize >> 8, pgLo: pageSize & 0xff, reserved: 16 + hmacSize,
+      });
+    }
+  }
+  if (!checks.length) return { candidates: [], scanned: 0 };
+  const candidates = [];
+  const seen = new Set();
+  const fd = fs.openSync(dumpPath, 'r');
+  const size = fs.fstatSync(fd).size;
+  const CHUNK = 16 * 1024 * 1024;
+  const OVERLAP = 32 + step; // 覆盖跨块窗口
+  const buf = Buffer.alloc(CHUNK + OVERLAP);
+  let scanned = 0;
+  let lastReport = 0;
+  let done = false;
+  for (let off = 0; off < size && !done; off += CHUNK) {
+    const got = fs.readSync(fd, buf, 0, CHUNK + OVERLAP, off);
+    if (got <= 32) break;
+    const limit = Math.min(CHUNK - step, got - 32); // 与下一块无缝衔接（CHUNK 是 step 的倍数）
+    for (let i = 0; i <= limit; i += step) {
+      scanned++;
+      for (const c of checks) {
+        const d = crypto.createDecipheriv('aes-256-cbc', buf.subarray(i, i + 32), c.iv);
+        d.setAutoPadding(false);
+        const dec = d.update(c.ct);
+        if (
+          dec[0] === c.pgHi && dec[1] === c.pgLo && dec[4] === c.reserved &&
+          dec[5] === 0x40 && dec[6] === 0x20 && dec[7] === 0x20
+        ) {
+          const keyHex = buf.toString('hex', i, i + 32);
+          if (!seen.has(keyHex)) {
+            seen.add(keyHex);
+            candidates.push({ keyHex, probe: c.name, pageSize: c.pageSize, hmacSize: c.hmacSize });
+            if (candidates.length >= maxCandidates) { done = true; break; }
+          }
+        }
+      }
+    }
+    if (onProgress && off - lastReport >= 64 * 1024 * 1024) {
+      lastReport = off;
+      onProgress(scanned, Math.min(off + CHUNK, size), size);
+    }
+  }
+  fs.closeSync(fd);
+  return { candidates, scanned };
+}
+
+/** hex 候选密钥在探针上验证（解密头特征），返回全部命中 [{keyHex,pageSize,hmacSize,probe}] */
+function verifyHexKeys(keys, probeHeads, report, label) {
+  const hits = [];
+  let tried = 0;
+  for (const hex of keys) {
+    tried++;
+    if (tried % 5000 === 0) report('solve', `${label}：已验证 ${tried}/${keys.length} 个密钥候选…`);
+    const keyBytes = Buffer.from(hex, 'hex');
+    for (const p of probeHeads) {
+      const params = trySqlCipherParams(p.buf, keyBytes);
+      if (params) {
+        hits.push({ keyHex: hex, ...params, probe: p.name });
+        break; // 同一 key 只记一次
+      }
+    }
+  }
+  return hits;
+}
+
+/**
+ * 二进制扫描多轮策略：
+ *  A = step4 × 默认参数(4096/hmac64) × 全部探针（≈每百 MB 1-2 分钟）
+ *  B = step1 × 默认参数 × 首探针（兜底：key 未对齐）
+ * 每轮候选先 HMAC 精验再解密特征确认，双保险排除误报；
+ * 返回该轮全部真 key（不同 EDB 可能用不同 key，需全部收集）。
+ */
+function runBinaryRounds(dumpPath, probeHeads, report, stats) {
+  const rounds = [
+    { label: '二进制扫描（步进4，SQLCipher 4 默认参数）', step: 4, probes: probeHeads },
+    { label: '二进制扫描（步进1，默认参数）', step: 1, probes: probeHeads.slice(0, 1) },
+  ];
+  for (const r of rounds) {
+    report('solve', `${r.label}…`);
+    const { candidates, scanned } = scanDumpForBinaryKeys(dumpPath, r.probes, {
+      step: r.step,
+      variants: [[4096, 64]],
+      onProgress: (n, doneBytes, total) => {
+        report('solve', `${r.label}：${(doneBytes / 1048576).toFixed(0)}/${(total / 1048576).toFixed(0)} MB，累计窗口 ${n}…`);
+      },
+    });
+    stats.binScanned += scanned;
+    stats.binCandidates += candidates.length;
+    stats.rounds.push(`${r.label}:窗口${scanned}/候选${candidates.length}`);
+    const hits = [];
+    for (const c of candidates) {
+      const keyBytes = Buffer.from(c.keyHex, 'hex');
+      const p = probeHeads.find((x) => x.name === c.probe) || probeHeads[0];
+      const okHmac = verifySqlCipherHmac(p.buf, keyBytes, c.pageSize, c.hmacSize);
+      const params = trySqlCipherParams(p.buf, keyBytes);
+      if (okHmac && params) hits.push({ keyHex: c.keyHex, ...params, probe: c.probe });
+    }
+    if (hits.length) return hits;
+    if (candidates.length) report('solve', `${r.label}：${candidates.length} 个过滤候选均未通过 HMAC 精验`);
+  }
+  return [];
+}
+
+/** 命中密钥集解密全部 EDB（各库可能 key/页参数不同，逐库在密钥集上自适应验证） */
+function decryptWithSqlCipherKeys(hits, usable, report) {
+  report('found', `SQLCipher 密钥命中 ${hits.length} 把：${hits.map((h) => `${h.keyHex.slice(0, 12)}…(${h.probe})`).join('、')}`);
+  const files = [];
+  let skipped = 0;
+  const usedKeys = new Set();
+  for (let i = 0; i < usable.length; i++) {
+    const edb = usable[i];
+    report('decrypt', `解密 ${edb.name}（${i + 1}/${usable.length}）…`);
+    try {
+      const buf = readEdbBuffer(edb);
+      let plain = null;
+      for (const hit of hits) {
+        const keyBytes = Buffer.from(hit.keyHex, 'hex');
+        // 每个 EDB 可能用不同 key/参数：先自身页1解密特征验证，再 HMAC 精验兜底
+        const params = trySqlCipherParams(buf, keyBytes) ||
+          (verifySqlCipherHmac(buf, keyBytes, hit.pageSize, hit.hmacSize) ? { pageSize: hit.pageSize, hmacSize: hit.hmacSize } : null);
+        if (!params) continue;
+        const out = decryptSqlCipherEdb(buf, keyBytes, params.pageSize, params.hmacSize);
+        if (out.subarray(0, 16).equals(SQLITE_HEAD_BUF)) {
+          plain = out;
+          usedKeys.add(hit.keyHex);
+          break;
+        }
+      }
+      if (plain) {
+        files.push({ name: edb.name, path: edb.path, chatId: edb.chatId, size: edb.size, data: new Uint8Array(plain) });
+      } else {
+        skipped++;
+      }
+    } catch (e) {
+      report('warn', `${edb.name} 解密失败：${e.message}`);
+    }
+  }
+  if (!files.length) return { ok: false, reason: '密钥命中探针但没有任何 EDB 解密成功' };
+  if (skipped) report('warn', `${skipped} 个 EDB 使用不同密钥或数据异常，已跳过（在 KakaoTalk 中打开对应聊天后重试可补全）`);
+  const first = hits.find((h) => usedKeys.has(h.keyHex)) || hits[0];
+  return {
+    ok: true,
+    params: { kind: 'sqlcipher', keyHex: first.keyHex, keyCount: hits.length, userId: null, pragma: null },
+    files,
+  };
+}
+
+/**
+ * SQLCipher 内存密钥恢复路线：dump KakaoTalk 进程私有内存 → hex 文本扫描 +
+ * 二进制窗口扫描（AES 过滤 + HMAC 精验）→ 命中后解密全部（不依赖设备材料与 userId）。
+ * 探针优先 TalkUserDB/chatListInfo/最大 chatLogs（登录后必然被加载，key 在内存概率最高）。
  */
 async function trySqlCipherFromMemory(edbs, onProgress) {
   const report = onProgress || (() => {});
   const { running, pids } = await isKakaoTalkRunning();
   if (!running) return { ok: false, reason: '内存密钥恢复需要 KakaoTalk 正在运行（请先启动并登录 KakaoTalk）' };
-  const usable = edbs.filter((e) => (e.size == null ? true : e.size >= 1024));
-  if (!usable.length) return { ok: false, reason: '没有可用于验证密钥的 EDB 文件' };
-  const probe = usable[0];
-  let probeBuf;
+  const usable = edbs.filter((e) => (e.size == null ? true : e.size >= 4096)); // SQLCipher 验证至少需要一整页
+  if (!usable.length) return { ok: false, reason: '没有足够大（≥4KB）的 EDB 文件可用于 SQLCipher 密钥验证' };
+  const desc = [...usable].sort((a, b) => (b.size || 0) - (a.size || 0));
+  const probes = pickSqlCipherProbes(desc, 3);
+  let probeHeads;
   try {
-    probeBuf = readEdbBuffer(probe);
+    probeHeads = probes.map((p) => ({ name: p.name, buf: readEdbHead(p, 8192) }));
   } catch (e) {
-    return { ok: false, reason: `无法读取 ${probe.name}：${e.message}` };
+    return { ok: false, reason: `无法读取探针 EDB：${e.message}` };
   }
-  report('solve', `导出 KakaoTalk 进程内存（PID ${pids[0]}）…`);
-  const dump = await dumpProcessMemory(pids[0]);
-  if (!dump.ok) return { ok: false, reason: dump.reason };
-  try {
-    const verify = (keys, label) => {
-      let tried = 0;
-      for (const hex of keys) {
-        tried++;
-        if (tried % 5000 === 0) report('solve', `${label}：已验证 ${tried}/${keys.length} 个密钥候选…`);
-        const params = trySqlCipherParams(probeBuf, Buffer.from(hex, 'hex'));
-        if (params) return { keyHex: hex, ...params };
-      }
-      return null;
-    };
-    let scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: false });
-    report('solve', `内存中发现 ${scan.wrappedCount} 个包装密钥候选，验证中…`);
-    let hit = scan.keys.length ? verify(scan.keys, '包装密钥') : null;
-    if (!hit) {
-      scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: true });
-      report('solve', `扩大扫描：共 ${scan.keys.length} 个 64hex 候选，验证中（可能需要数十秒）…`);
-      hit = scan.keys.length ? verify(scan.keys, '全量候选') : null;
+  report('solve', `SQLCipher 探针：${probeHeads.map((p) => p.name).join('、')}`);
+
+  const stats = { pids: [], hexWrapped: 0, hexBare: 0, binScanned: 0, binCandidates: 0, rounds: [] };
+  for (const pid of pids.slice(0, 3)) {
+    report('solve', `导出 KakaoTalk 进程内存（PID ${pid}，仅私有内存）…`);
+    const dump = await dumpProcessMemory(pid, 300000, { privateOnly: true });
+    if (!dump.ok) {
+      report('warn', `PID ${pid} 内存导出失败：${dump.reason}`);
+      continue;
     }
-    if (!hit) return { ok: false, reason: '内存中未找到有效 SQLCipher 密钥（请确认 KakaoTalk 已登录并打开过聊天窗口）' };
-    report('found', `SQLCipher 密钥命中：${hit.keyHex.slice(0, 16)}…（page=${hit.pageSize}，hmac=${hit.hmacSize}）`);
-    const keyBytes = Buffer.from(hit.keyHex, 'hex');
-    const files = [];
-    for (let i = 0; i < usable.length; i++) {
-      const edb = usable[i];
-      report('decrypt', `解密 ${edb.name}（${i + 1}/${usable.length}）…`);
-      try {
-        const buf = readEdbBuffer(edb);
-        const plain = decryptSqlCipherEdb(buf, keyBytes, hit.pageSize, hit.hmacSize);
-        if (plain.subarray(0, 16).equals(SQLITE_HEAD_BUF)) {
-          files.push({ name: edb.name, path: edb.path, chatId: edb.chatId, size: edb.size, data: new Uint8Array(plain) });
-        }
-      } catch (e) {
-        report('warn', `${edb.name} 解密失败：${e.message}`);
+    stats.pids.push(pid);
+    let dumpSize = 0;
+    try { dumpSize = fs.statSync(dump.dumpPath).size; } catch { /* 忽略 */ }
+    report('solve', `内存导出完成（${(dumpSize / 1048576).toFixed(0)} MB），开始扫描密钥…`);
+    try {
+      // 轮1：hex 文本形态密钥（x'' 包装优先，再裸 64hex），秒级
+      let scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: false });
+      stats.hexWrapped = scan.keys.length;
+      let hits = verifyHexKeys(scan.keys, probeHeads, report, '包装密钥');
+      if (!hits.length) {
+        scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: true });
+        stats.hexBare = scan.keys.length;
+        hits = verifyHexKeys(scan.keys, probeHeads, report, '全量 hex 候选');
       }
+      // 轮2：二进制窗口扫描（key 不以文本形态存在时）
+      if (!hits.length) {
+        report('solve', '内存中未发现文本形态密钥，开始二进制窗口扫描（约 2-6 分钟，请耐心等待）…');
+        hits = runBinaryRounds(dump.dumpPath, probeHeads, report, stats);
+      }
+      if (hits.length) {
+        const dec = decryptWithSqlCipherKeys(hits, usable, report);
+        if (dec.ok) return dec;
+        report('warn', `${dec.reason}，继续扫描其它进程/轮次…`);
+      }
+    } finally {
+      try { fs.unlinkSync(dump.dumpPath); } catch { /* 清理失败不阻塞 */ }
     }
-    if (!files.length) return { ok: false, reason: 'SQLCipher 密钥命中但没有任何 EDB 解密成功' };
-    return { ok: true, params: { kind: 'sqlcipher', keyHex: hit.keyHex, userId: null, pragma: null }, files };
-  } finally {
-    try { fs.unlinkSync(dump.dumpPath); } catch { /* 清理失败不阻塞 */ }
   }
+  return {
+    ok: false,
+    reason: `内存中未找到有效 SQLCipher 密钥（进程=${stats.pids.join(',') || '无'}，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`,
+  };
 }
 
 /* ============ 汇总：Windows 自动发现 ============ */
@@ -692,5 +914,12 @@ module.exports = {
   scanDumpForRawKeys,
   trySqlCipherParams,
   decryptSqlCipherEdb,
+  verifySqlCipherHmac,
+  readEdbHead,
+  pickSqlCipherProbes,
+  scanDumpForBinaryKeys,
+  verifyHexKeys,
+  runBinaryRounds,
+  decryptWithSqlCipherKeys,
   trySqlCipherFromMemory,
 };
