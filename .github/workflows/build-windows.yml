@@ -35,10 +35,13 @@ jobs:
         run: npm ci
 
       - name: Build Windows (Setup + Portable)
-        run: npm run dist:win
+        run: npx electron-builder --win --publish never
         env:
           # 不让 electron-builder 推代码签名（无 EV 证书）
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          # 显式置空，避免 CI 模式下自动 publish
+          GH_TOKEN: ''
+          GH_RELEASE: 'false'
 
       - name: List release artifacts
         shell: bash
