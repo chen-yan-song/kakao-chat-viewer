@@ -326,10 +326,13 @@ $h = [KkvMem]::OpenProcess(0x0410, $false, $TargetPid)
 if ($h -eq [IntPtr]::Zero) { Write-Error 'OpenProcess failed'; exit 1 }
 $buf = New-Object byte[] 16777216
 $read = 0
-# 阶段1：枚举所有 region
-$regions = New-Object System.Collections.Generic.List[object]
+# 阶段1+2+3 合并：与 scripts/win-diagnostic.ps1 架构一致（v2.0.4 证明中间层 $regions.Add 在某些 PowerShell 5.1 环境抛错被吞导致 0 region，
+# 彻底重写为枚举+读取+写入单循环，跟诊断脚本一样能成功 dump 0.5GB）
 $addr = [IntPtr]::Zero
 $commitCount = 0
+$matchedCount = 0
+$totalBytes = [long]0
+$fs = [System.IO.File]::Create($OutFile)
 $firstDbg = $true
 while ($true) {
   $mbi = New-Object KkvMem+MEMORY_BASIC_INFORMATION
@@ -339,33 +342,23 @@ while ($true) {
   if ($firstDbg) { Write-Output ("DBG MBI sizeOf=" + [Runtime.InteropServices.Marshal]::SizeOf($mbi) + " firstBase=0x{0:X} firstSize={1} firstState=0x{2:X} firstProtect=0x{3:X} firstType=0x{4:X} addrPtr=0x{5:X}" -f [int64]$mbi.BaseAddress, $region, $mbi.State, $mbi.Protect, $mbi.Type, [int64]$addr); $firstDbg = $false }
   if ($mbi.State -eq 0x1000 -and $region -gt 0 -and $region -le 268435456) {
     $commitCount++
-    # v2.0.4 彻底简化：诊断脚本（scripts/win-diagnostic.ps1）能 dump 0.5GB 成功（无任何 protOk/typeOk 过滤），
-    # 之前 v2.0.2 / v2.0.3 加 if ($protOk -and $typeOk) 在某些环境 0 region 加入（理论上不应发生），
-    # 改为直接 Add region，靠 ReadProcessMemory 自身在 NOACCESS/EXECUTE-only 区域返回 false 即可保护。
-    $regions.Add([pscustomobject]@{ Base = [int64]$mbi.BaseAddress; Size = $region })
+    $matchedCount++
+    # 跟诊断脚本一致：直接 ReadProcessMemory + Write，靠 RPM 自身在 NOACCESS/EXECUTE-only 区域返回 false 保护
+    $remain = $region
+    $cur = [int64]$mbi.BaseAddress
+    while ($remain -gt 0) {
+      $take = [int][Math]::Min($remain, $buf.Length)
+      $ok = [KkvMem]::ReadProcessMemory($h, [IntPtr]$cur, $buf, $take, [ref]$read)
+      if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read); $totalBytes += $read }
+      $cur += $take
+      $remain -= $take
+    }
   }
   $addr = [IntPtr]([int64]$mbi.BaseAddress + $region)
   if ([int64]$addr -le 0) { break }
 }
-$matchedCount = $regions.Count
-# 阶段2：按 size 降序排序（kakaocli-win 实测：KakaoTalk 的 SQLCipher raw key 多驻留在大私有堆 ≥800KB，让大 region 优先被 Node 扫描到）
-$sorted = $regions | Sort-Object -Property Size -Descending
-# 阶段3：按顺序读取并写入 dump
-$fs = [System.IO.File]::Create($OutFile)
-$totalBytes = [long]0
-foreach ($r in $sorted) {
-  $remain = $r.Size
-  $cur = $r.Base
-  while ($remain -gt 0) {
-    $take = [int][Math]::Min($remain, $buf.Length)
-    $ok = [KkvMem]::ReadProcessMemory($h, [IntPtr]$cur, $buf, $take, [ref]$read)
-    if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read); $totalBytes += $read }
-    $cur += $take
-    $remain -= $take
-  }
-}
 $fs.Close()
-Write-Output ("DUMPSTATS commit=$commitCount matched=$matchedCount bytes=$totalBytes regions=$($sorted.Count)")
+Write-Output ("DUMPSTATS commit=$commitCount matched=$matchedCount bytes=$totalBytes regions=$matchedCount")
 `;
   fs.writeFileSync(ps1, script, 'utf8');
   return ps1;
