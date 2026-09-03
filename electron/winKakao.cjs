@@ -324,13 +324,12 @@ public class KkvMem {
 Add-Type -TypeDefinition $sig
 $h = [KkvMem]::OpenProcess(0x0410, $false, $TargetPid)
 if ($h -eq [IntPtr]::Zero) { Write-Error 'OpenProcess failed'; exit 1 }
-$fs = [System.IO.File]::Create($OutFile)
-$addr = [IntPtr]::Zero
 $buf = New-Object byte[] 16777216
 $read = 0
-$totalBytes = [long]0
+# 阶段1：枚举所有 region
+$regions = New-Object System.Collections.Generic.List[object]
+$addr = [IntPtr]::Zero
 $commitCount = 0
-$matchedCount = 0
 while ($true) {
   $mbi = New-Object KkvMem+MEMORY_BASIC_INFORMATION
   $ret = [KkvMem]::VirtualQueryEx($h, $addr, [ref]$mbi, [Runtime.InteropServices.Marshal]::SizeOf($mbi))
@@ -342,23 +341,31 @@ while ($true) {
     $protOk = (($mbi.Protect -band 0xEE) -ne 0) -and (($mbi.Protect -band 0x100) -eq 0)
     $typeOk = (-not $PrivateOnly) -or ($mbi.Type -eq 0x20000)
     if ($protOk -and $typeOk) {
-    $matchedCount++
-    $remain = $region
-    $cur = [int64]$mbi.BaseAddress
-    while ($remain -gt 0) {
-      $take = [int][Math]::Min($remain, $buf.Length)
-      $ok = [KkvMem]::ReadProcessMemory($h, [IntPtr]$cur, $buf, $take, [ref]$read)
-      if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read); $totalBytes += $read }
-      $cur += $take
-      $remain -= $take
-    }
+      $regions.Add([pscustomobject]@{ Base = [int64]$mbi.BaseAddress; Size = $region })
     }
   }
   $addr = [IntPtr]([int64]$mbi.BaseAddress + $region)
   if ([int64]$addr -le 0) { break }
 }
+$matchedCount = $regions.Count
+# 阶段2：按 size 降序排序（kakaocli-win 实测：KakaoTalk 的 SQLCipher raw key 多驻留在大私有堆 ≥800KB，让大 region 优先被 Node 扫描到）
+$sorted = $regions | Sort-Object -Property Size -Descending
+# 阶段3：按顺序读取并写入 dump
+$fs = [System.IO.File]::Create($OutFile)
+$totalBytes = [long]0
+foreach ($r in $sorted) {
+  $remain = $r.Size
+  $cur = $r.Base
+  while ($remain -gt 0) {
+    $take = [int][Math]::Min($remain, $buf.Length)
+    $ok = [KkvMem]::ReadProcessMemory($h, [IntPtr]$cur, $buf, $take, [ref]$read)
+    if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read); $totalBytes += $read }
+    $cur += $take
+    $remain -= $take
+  }
+}
 $fs.Close()
-Write-Output ("DUMPSTATS commit=$commitCount matched=$matchedCount bytes=$totalBytes")
+Write-Output ("DUMPSTATS commit=$commitCount matched=$matchedCount bytes=$totalBytes regions=$($sorted.Count)")
 `;
   fs.writeFileSync(ps1, script, 'utf8');
   return ps1;
@@ -383,8 +390,10 @@ function dumpProcessMemory(pid, timeoutMs = 300000, { privateOnly = false } = {}
     const timer = setTimeout(() => { try { child.kill(); } catch { /* 忽略 */ } }, timeoutMs);
     child.on('close', (code) => {
       clearTimeout(timer);
-      const m = stdout.match(/DUMPSTATS commit=(\d+) matched=(\d+) bytes=(\d+)/);
-      const dumpStats = m ? { commit: Number(m[1]), matched: Number(m[2]), bytes: Number(m[3]) } : null;
+      const m = stdout.match(/DUMPSTATS commit=(\d+) matched=(\d+) bytes=(\d+)(?: regions=(\d+))?/);
+      const dumpStats = m
+        ? { commit: Number(m[1]), matched: Number(m[2]), bytes: Number(m[3]), regions: m[4] ? Number(m[4]) : null }
+        : null;
       let size = 0;
       try { size = fs.statSync(dumpPath).size; } catch { /* 文件不存在 */ }
       if (code !== 0 || !fs.existsSync(dumpPath)) {
@@ -523,6 +532,7 @@ function decryptSqlCipherEdb(buf, keyBytes, pageSize, hmacSize) {
     d.setAutoPadding(false);
     const dec = Buffer.concat([d.update(buf.subarray(start, start + len)), d.final()]);
     dec.copy(out, base + (p === 0 ? 16 : 0));
+    if (p === 0) out[20] = 0; // 关键：清零 SQLite header byte 20（reserved space），SQLCipher 把它当 codec 保留（=80），plain SQLite 必须为 0
   }
   return out;
 }
@@ -580,12 +590,14 @@ function pickSqlCipherProbes(edbsDesc, max = 3) {
 }
 
 /**
- * 二进制窗口扫描：对 dump 以 32 字节/step 步进窗口做 AES 快速过滤
- *（解密探针页1首块检查 SQLite 头特征），不依赖 key 在内存中的 hex 文本形态
- *（KakaoTalk 可能通过 C API 传二进制原始 key）。命中窗口收为候选，由调用方 HMAC 精验。
+ * 二进制窗口扫描：对 dump 以 32 字节/step 步进窗口做快速过滤
+ *  1. 向量化预过滤（kakaocli-win 同款）：32 字节窗口内 0x00 字节数 ≤ 4 且可打印 ASCII 字符数 ≤ 27
+ *  2. 多样性检查：32 字节内不同字节数 ≥ 18
+ *  3. AES 解密探针页1首块检查 SQLite 头特征
+ * 命中窗口收为候选，由调用方 HMAC 精验。
  * @param {string} dumpPath 内存 dump 文件
  * @param {Array<{name:string,buf:Buffer}>} probes 探针页1头部（≥ pageSize）
- * @returns {{candidates:Array<{keyHex:string,probe:string,pageSize:number,hmacSize:number}>, scanned:number}}
+ * @returns {{candidates:Array<{keyHex:string,probe:string,pageSize:number,hmacSize:number}>, scanned:number, filtered:number}}
  */
 function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 64]], maxCandidates = 50000, onProgress } = {}) {
   const checks = [];
@@ -601,7 +613,7 @@ function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 
       });
     }
   }
-  if (!checks.length) return { candidates: [], scanned: 0 };
+  if (!checks.length) return { candidates: [], scanned: 0, filtered: 0 };
   const candidates = [];
   const seen = new Set();
   const fd = fs.openSync(dumpPath, 'r');
@@ -610,23 +622,50 @@ function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 
   const OVERLAP = 32 + step; // 覆盖跨块窗口
   const buf = Buffer.alloc(CHUNK + OVERLAP);
   let scanned = 0;
+  let filtered = 0; // 向量化过滤掉的窗口数
   let lastReport = 0;
   let done = false;
   for (let off = 0; off < size && !done; off += CHUNK) {
     const got = fs.readSync(fd, buf, 0, CHUNK + OVERLAP, off);
     if (got <= 32) break;
     const limit = Math.min(CHUNK - step, got - 32); // 与下一块无缝衔接（CHUNK 是 step 的倍数）
+    // 向量化预过滤：单次 O(n) 扫描算 zero/printable 累加和，内层只查表 O(1)
+    const usableLen = limit + step; // 最远需要读到 limit+32-1
+    const zeroPrefix = new Int32Array(usableLen + 1);
+    const printablePrefix = new Int32Array(usableLen + 1);
+    for (let i = 0; i < usableLen; i++) {
+      const b = buf[i];
+      zeroPrefix[i + 1] = zeroPrefix[i] + (b === 0 ? 1 : 0);
+      printablePrefix[i + 1] = printablePrefix[i] + ((b >= 0x20 && b <= 0x7E) ? 1 : 0);
+    }
+    // 收集通过快速过滤的窗口起点
+    const offsets = [];
     for (let i = 0; i <= limit; i += step) {
-      scanned++;
+      const zeros = zeroPrefix[i + 32] - zeroPrefix[i];
+      const printable = printablePrefix[i + 32] - printablePrefix[i];
+      if (zeros <= 4 && printable <= 27) offsets.push(i);
+      else filtered++;
+    }
+    scanned += offsets.length;
+    for (const i of offsets) {
+      const keyBytes = buf.subarray(i, i + 32);
+      // 多样性检查：32 字节内不同字节数 ≥ 18（kakaocli-win 经验：堆元数据/指针域通不过此阈）
+      const uniq = new Uint8Array(256);
+      let uniqCount = 0;
+      for (let j = 0; j < 32; j++) {
+        if (!uniq[keyBytes[j]]) { uniq[keyBytes[j]] = 1; uniqCount++; }
+        if (uniqCount + (32 - j - 1) < 18) break; // 提前退出：剩余字节即使全不同也凑不到 18
+      }
+      if (uniqCount < 18) continue;
       for (const c of checks) {
-        const d = crypto.createDecipheriv('aes-256-cbc', buf.subarray(i, i + 32), c.iv);
+        const d = crypto.createDecipheriv('aes-256-cbc', keyBytes, c.iv);
         d.setAutoPadding(false);
         const dec = d.update(c.ct);
         if (
           dec[0] === c.pgHi && dec[1] === c.pgLo && dec[4] === c.reserved &&
           dec[5] === 0x40 && dec[6] === 0x20 && dec[7] === 0x20
         ) {
-          const keyHex = buf.toString('hex', i, i + 32);
+          const keyHex = keyBytes.toString('hex');
           if (!seen.has(keyHex)) {
             seen.add(keyHex);
             candidates.push({ keyHex, probe: c.name, pageSize: c.pageSize, hmacSize: c.hmacSize });
@@ -641,7 +680,7 @@ function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 
     }
   }
   fs.closeSync(fd);
-  return { candidates, scanned };
+  return { candidates, scanned, filtered };
 }
 
 /** hex 候选密钥在探针上验证（解密头特征），返回全部命中 [{keyHex,pageSize,hmacSize,probe}] */
@@ -663,23 +702,26 @@ function verifyHexKeys(keys, probeHeads, report, label) {
   return hits;
 }
 
+/** SQLCipher 全部支持的 (pageSize, hmacSize) 变体（kakaocli-win 实机验证：KakaoTalk 可能使用非默认组合） */
+const SQLCIPHER_VARIANTS = [[4096, 64], [4096, 32], [4096, 0], [1024, 64], [1024, 32], [1024, 0]];
+
 /**
  * 二进制扫描多轮策略：
- *  A = step4 × 默认参数(4096/hmac64) × 全部探针（≈每百 MB 1-2 分钟）
- *  B = step1 × 默认参数 × 首探针（兜底：key 未对齐）
+ *  A = step4 × 全部 6 种参数变体 × 全部探针（≈每百 MB 1-2 分钟）
+ *  B = step1 × 全部变体 × 首探针（兜底：key 未对齐）
  * 每轮候选先 HMAC 精验再解密特征确认，双保险排除误报；
  * 返回该轮全部真 key（不同 EDB 可能用不同 key，需全部收集）。
  */
 function runBinaryRounds(dumpPath, probeHeads, report, stats) {
   const rounds = [
-    { label: '二进制扫描（步进4，SQLCipher 4 默认参数）', step: 4, probes: probeHeads },
-    { label: '二进制扫描（步进1，默认参数）', step: 1, probes: probeHeads.slice(0, 1) },
+    { label: '二进制扫描（步进4，SQLCipher 4 全部 6 种参数变体）', step: 4, probes: probeHeads },
+    { label: '二进制扫描（步进1，6 种参数变体，首探针）', step: 1, probes: probeHeads.slice(0, 1) },
   ];
   for (const r of rounds) {
     report('solve', `${r.label}…`);
     const { candidates, scanned } = scanDumpForBinaryKeys(dumpPath, r.probes, {
       step: r.step,
-      variants: [[4096, 64]],
+      variants: SQLCIPHER_VARIANTS,
       onProgress: (n, doneBytes, total) => {
         report('solve', `${r.label}：${(doneBytes / 1048576).toFixed(0)}/${(total / 1048576).toFixed(0)} MB，累计窗口 ${n}…`);
       },
@@ -821,7 +863,9 @@ async function trySqlCipherFromMemory(edbs, onProgress) {
       try { fs.unlinkSync(dump.dumpPath); } catch { /* 清理失败不阻塞 */ }
     }
   }
-  const dstat = stats.dumpStats ? `，提交区 ${stats.dumpStats.commit}/命中 ${stats.dumpStats.matched}` : '';
+  const dstat = stats.dumpStats
+    ? `，提交区 ${stats.dumpStats.commit}/命中 ${stats.dumpStats.matched}${stats.dumpStats.regions != null ? `/region ${stats.dumpStats.regions}` : ''}`
+    : '';
   return {
     ok: false,
     reason: `内存中未找到有效 SQLCipher 密钥（发现进程 ${stats.pidsFound} 个/成功导出 [${stats.pids.join(',') || '无'}]，导出内存 ${stats.dumpMB}MB${dstat}，探针[${stats.probeInfo.join(' ')}]，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`,
