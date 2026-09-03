@@ -330,21 +330,19 @@ $read = 0
 $regions = New-Object System.Collections.Generic.List[object]
 $addr = [IntPtr]::Zero
 $commitCount = 0
+$firstDbg = $true
 while ($true) {
   $mbi = New-Object KkvMem+MEMORY_BASIC_INFORMATION
   $ret = [KkvMem]::VirtualQueryEx($h, $addr, [ref]$mbi, [Runtime.InteropServices.Marshal]::SizeOf($mbi))
   if ($ret -eq [IntPtr]::Zero) { break }
   $region = [int64]$mbi.RegionSize
+  if ($firstDbg) { Write-Output ("DBG MBI sizeOf=" + [Runtime.InteropServices.Marshal]::SizeOf($mbi) + " firstBase=0x{0:X} firstSize={1} firstState=0x{2:X} firstProtect=0x{3:X} firstType=0x{4:X} addrPtr=0x{5:X}" -f [int64]$mbi.BaseAddress, $region, $mbi.State, $mbi.Protect, $mbi.Type, [int64]$addr); $firstDbg = $false }
   if ($mbi.State -eq 0x1000 -and $region -gt 0 -and $region -le 268435456) {
     $commitCount++
-    # 不再过滤 protOk：诊断脚本能 dump 0.5GB，但本 PowerShell 加上 0xEE mask 后 matched=0。
-    # 原因：在 32 位 PowerShell 或 WOW64 下，Marshal.SizeOf(MBI) 返回 28 字节，Protect/Type 字段落在后 20 字节永远 = 0，
-    # 导致 protOk/typeOk 永远 false。ReadProcessMemory 自身在 NOACCESS/EXECUTE-only 区域会自然返回 false，安全。
-    $protOk = $true
-    $typeOk = $true
-    if ($protOk -and $typeOk) {
-      $regions.Add([pscustomobject]@{ Base = [int64]$mbi.BaseAddress; Size = $region })
-    }
+    # v2.0.4 彻底简化：诊断脚本（scripts/win-diagnostic.ps1）能 dump 0.5GB 成功（无任何 protOk/typeOk 过滤），
+    # 之前 v2.0.2 / v2.0.3 加 if ($protOk -and $typeOk) 在某些环境 0 region 加入（理论上不应发生），
+    # 改为直接 Add region，靠 ReadProcessMemory 自身在 NOACCESS/EXECUTE-only 区域返回 false 即可保护。
+    $regions.Add([pscustomobject]@{ Base = [int64]$mbi.BaseAddress; Size = $region })
   }
   $addr = [IntPtr]([int64]$mbi.BaseAddress + $region)
   if ([int64]$addr -le 0) { break }
