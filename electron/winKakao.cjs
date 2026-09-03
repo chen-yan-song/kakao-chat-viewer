@@ -337,8 +337,10 @@ while ($true) {
   $region = [int64]$mbi.RegionSize
   if ($mbi.State -eq 0x1000 -and $region -gt 0 -and $region -le 268435456) {
     $commitCount++
-    # 可读保护位（0x02/0x04/0x08/0x20/0x40/0x80），排除 PAGE_GUARD(0x100)；PrivateOnly 时仅 MEM_PRIVATE(0x20000) 堆内存
-    $protOk = (($mbi.Protect -band 0xEE) -ne 0) -and (($mbi.Protect -band 0x100) -eq 0)
+    # 不再过滤 protOk：诊断脚本能 dump 0.5GB，但本 PowerShell 加上 0xEE mask 后 matched=0。
+    # 原因：在 32 位 PowerShell 或 WOW64 下，Marshal.SizeOf(MBI) 返回 28 字节，Protect/Type 字段落在后 20 字节永远 = 0，
+    # 导致 protOk/typeOk 永远 false。ReadProcessMemory 自身在 NOACCESS/EXECUTE-only 区域会自然返回 false，安全。
+    $protOk = $true
     $typeOk = (-not $PrivateOnly) -or ($mbi.Type -eq 0x20000)
     if ($protOk -and $typeOk) {
       $regions.Add([pscustomobject]@{ Base = [int64]$mbi.BaseAddress; Size = $region })
@@ -819,9 +821,11 @@ async function trySqlCipherFromMemory(edbs, onProgress) {
   for (const pid of pids.slice(0, 3)) {
     report('solve', `导出 KakaoTalk 进程内存（PID ${pid}，仅私有内存）…`);
     let dump = await dumpProcessMemory(pid, 300000, { privateOnly: true });
-    if (dump.ok && (dump.size || 0) < 1024 * 1024) {
-      // 私有内存过滤在本机可能过严（不同 KakaoTalk 版本内存布局差异）：回退导出全部可读内存
-      report('warn', `PID ${pid} 私有内存仅 ${((dump.size || 0) / 1048576).toFixed(1)}MB，回退导出全部可读内存…`);
+    const dumpMatched = dump.dumpStats ? (dump.dumpStats.matched || 0) : 0;
+    if (dump.ok && (dumpMatched === 0 || (dump.size || 0) < 1024 * 1024)) {
+      // matched=0 或 < 1MB：可能是 privateOnly 过滤过严 或 protOk 计算出错，回退导出全部可读内存
+      const reason = dumpMatched === 0 ? '私有内存 region 全部未通过过滤' : `私有内存仅 ${((dump.size || 0) / 1048576).toFixed(1)}MB`;
+      report('warn', `PID ${pid} ${reason}，回退导出全部可读内存…`);
       const full = await dumpProcessMemory(pid, 300000, { privateOnly: false });
       if (full.ok && (full.size || 0) > (dump.size || 0)) {
         try { fs.unlinkSync(dump.dumpPath); } catch { /* 忽略 */ }
@@ -864,7 +868,7 @@ async function trySqlCipherFromMemory(edbs, onProgress) {
     }
   }
   const dstat = stats.dumpStats
-    ? `，提交区 ${stats.dumpStats.commit}/命中 ${stats.dumpStats.matched}${stats.dumpStats.regions != null ? `/region ${stats.dumpStats.regions}` : ''}`
+    ? `，提交区 ${stats.dumpStats.commit}/命中 ${stats.dumpStats.matched}/bytes ${stats.dumpStats.bytes || 0}${stats.dumpStats.regions != null ? `/region ${stats.dumpStats.regions}` : ''}`
     : '';
   return {
     ok: false,
