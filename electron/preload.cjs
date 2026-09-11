@@ -7,6 +7,9 @@ contextBridge.exposeInMainWorld('kakaoApp', {
   /** 渲染进程日志转发到主进程（诊断用） */
   log: (msg) => ipcRenderer.send('renderer-log', String(msg)),
 
+  /** 渲染进程日志文件路径（打包版无控制台，排查问题用） */
+  getLogPath: () => ipcRenderer.invoke('get-log-path'),
+
   /** 自动发现：UUID、plist 内容、数据库文件列表（macOS） */
   discover: () => ipcRenderer.invoke('discover'),
 

@@ -244,26 +244,56 @@ async function openWindowsDatabase(edbFiles, userId, opts = {}) {
     el.userIdInput.value = String(userId);
 
     // Windows 密钥：PBKDF2(userId, 材料中的 uuid 段)——仅需派生稳定一致，不参与 EDB 解密
-    const key = await deriveSecureKey(userId, uuidPart);
-    el.progressText.textContent = '正在汇总统一查询库…';
-    const db = new KakaoDB();
-    await db.openUnifiedWindows(edbs, key, userId, (stage, detail) => {
-      if (stage === 'done') {
-        el.progressBar.className = 'progress-bar';
-        el.progressBar.style.width = '100%';
-        el.progressText.textContent = '✅ ' + detail;
-      } else {
-        el.progressText.textContent = detail;
+    // 看门狗：汇总链路任一阶段超过 2 分钟无进展则判为卡死（实机出现过 360 拦截导致
+    // Promise 悬挂、全进程 0% CPU、界面永远停在「正在汇总」），抛出带阶段信息的错误
+    let lastPhase = '初始化';
+    let lastPhaseAt = Date.now();
+    const track = (p) => { lastPhase = p; lastPhaseAt = Date.now(); };
+    let stuckReject;
+    const stuckPromise = new Promise((_, rej) => { stuckReject = rej; });
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastPhaseAt > 120000) {
+        clearInterval(watchdog);
+        stuckReject(new Error(`「${lastPhase}」阶段超过 2 分钟无进展，疑似被安全软件拦截（请将本程序加入 360/杀毒软件信任区后重试）或数据异常，请将日志文件发给维护者`));
       }
-    });
-    state.db = db;
-    state.myId = db.myUserId() ?? userId;
-    await enterViewer();
-    return true;
+    }, 5000);
+    // 汇总管线整体与看门狗竞速：看门狗触发即抛错（管线本身无法中断，留在后台无妨）
+    const pipeline = (async () => {
+      track('派生统一库密钥');
+      const key = await deriveSecureKey(userId, uuidPart);
+      el.progressText.textContent = '正在汇总统一查询库…';
+      const db = new KakaoDB();
+      await db.openUnifiedWindows(edbs, key, userId, (stage, detail) => {
+        track(detail); // 每个子阶段都喂给看门狗
+        if (stage === 'done') {
+          el.progressBar.className = 'progress-bar';
+          el.progressBar.style.width = '100%';
+          el.progressText.textContent = '✅ ' + detail;
+        } else {
+          el.progressText.textContent = detail;
+        }
+      });
+      track('加载聊天界面');
+      state.db = db;
+      state.myId = db.myUserId() ?? userId;
+      await enterViewer();
+    })();
+    // pipeline 自身 reject 也要能正常传播，且不因 stuckPromise 先 reject 变成未处理拒绝
+    stuckPromise.catch(() => {});
+    try {
+      await Promise.race([pipeline, stuckPromise]);
+      return true;
+    } finally {
+      clearInterval(watchdog);
+    }
   } catch (e) {
     el.progressBar.className = 'progress-bar';
     el.progressBar.style.width = '0%';
     el.progressArea.hidden = true;
+    // 记录详细原因供自动流程步骤展示与日志排查（自动面板不显示手动区错误）
+    window.__lastOpenError = e.message;
+    console.error('[openWindowsDatabase]', e);
+    if (inElectron() && window.kakaoApp) window.kakaoApp.log('[openWindowsDatabase] 失败: ' + (e.stack || e.message));
     showError('Windows 数据汇总失败：' + e.message);
     el.openBtn.disabled = false;
     return false;

@@ -123,9 +123,20 @@ function scanDbDir() {
 }
 
 // 渲染进程日志通道（console-message 事件在 Electron 33 不可靠，改用 IPC）
+// 同时落盘到日志文件：打包版 Windows 应用无控制台，卡死/报错时用户可回传日志定位
+function rendererLogFile() {
+  return path.join(app.getPath('userData'), 'kkv-renderer.log');
+}
 ipcMain.on('renderer-log', (_e, msg) => {
   console.log('[renderer]', msg);
+  try {
+    const f = rendererLogFile();
+    // 超过 512KB 清空重写，避免无限膨胀
+    if (fs.existsSync(f) && fs.statSync(f).size > 512 * 1024) fs.writeFileSync(f, '');
+    fs.appendFileSync(f, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { /* 日志写入失败不影响主流程 */ }
 });
+ipcMain.handle('get-log-path', () => rendererLogFile());
 
 // ============ IPC：自动发现 ============
 ipcMain.handle('discover', async () => {

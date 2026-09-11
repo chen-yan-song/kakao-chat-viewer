@@ -1,6 +1,6 @@
 {
   "name": "kakao-chat-viewer",
-  "version": "2.1.4",
+  "version": "2.1.5",
   "description": "KakaoTalk macOS 聊天记录查看与导出（Mac App，全自动解密）",
   "type": "module",
   "private": true,

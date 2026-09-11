@@ -272,17 +272,45 @@ export class KakaoDB {
             return hit ? 's.' + qid(hit) : 'NULL';
           };
           const chatId = edb.chatId ? Number(edb.chatId) : null;
-          udb.exec(`
-            INSERT INTO NTChatMessage (chatId, authorId, message, type, sentAt)
-            SELECT ${chatId == null ? 'NULL' : Number(chatId)},
-                   ${pick(['authorId', 'from', 'senderId', 'userId'])},
-                   ${pick(['message', 'msg', 'content', 'text'])},
-                   ${pick(['type', 'msgType', 'messageType'])},
-                   ${pick(['sendAt', 'time', 'timestamp', 'createdAt', 'date'])}
-            FROM src.${qid(logTable)} s
-          `);
-          const stat = udb.query(`SELECT count(*) AS c FROM src.${qid(logTable)}`)[0];
-          msgCount += Number(stat.c);
+          // 分批导入消息（防御病态数据/损坏页导致 wasm 全表扫描卡死；每批有界可观察）
+          const MBATCH = 500;
+          const MAX_MBATCH = 4000; // 硬上限 200 万条
+          // WITHOUT ROWID 表没有 rowid：先探测，不可用则退回整表导入
+          let paged = true;
+          try { udb.query(`SELECT rowid FROM src.${qid(logTable)} LIMIT 1`); } catch { paged = false; }
+          let msgBatchErr = false;
+          for (let off = 0, mb = 0; mb < MAX_MBATCH; off += MBATCH, mb++) {
+            const srcSel = paged
+              ? `(SELECT * FROM src.${qid(logTable)} ORDER BY rowid LIMIT ${MBATCH} OFFSET ${off})`
+              : `src.${qid(logTable)}`;
+            try {
+              udb.exec(`
+                INSERT INTO NTChatMessage (chatId, authorId, message, type, sentAt)
+                SELECT ${chatId == null ? 'NULL' : Number(chatId)},
+                       ${pick(['authorId', 'from', 'senderId', 'userId'])},
+                       ${pick(['message', 'msg', 'content', 'text'])},
+                       ${pick(['type', 'msgType', 'messageType'])},
+                       ${pick(['sendAt', 'time', 'timestamp', 'createdAt', 'date'])}
+                FROM ${srcSel} s
+              `);
+            } catch (e) {
+              msgBatchErr = true;
+              report('warn', `${edb.name} 消息导入中断于第 ${off} 条（${String(e.message).slice(0, 80)}），已入库部分保留`);
+              break;
+            }
+            if (!paged) break; // 整表模式一次完成
+            const cnt = Number(udb.query('SELECT changes() AS c')[0].c);
+            if (mb % 10 === 9) report('ingest', `导入 ${edb.name}：消息已导入 ${off + cnt} 条…`);
+            if (cnt < MBATCH) break; // 不足一批 = 读完
+          }
+          if (msgBatchErr) { /* 已 report */ }
+          let statC = 0;
+          try {
+            statC = Number(udb.query(`SELECT count(*) AS c FROM src.${qid(logTable)}`)[0].c);
+          } catch { /* 坏页导致 COUNT 失败时以已导入数为准 */
+            statC = Number(udb.query('SELECT COUNT(*) AS c FROM NTChatMessage')[0].c);
+          }
+          msgCount += statC;
           if (chatId != null) {
             const agg = udb.query(`
               SELECT max(${pick(['_id', 'id', 'msgId', 'logId']).replace(/^s\./, 's.')}) AS lastLogId,
@@ -319,9 +347,10 @@ export class KakaoDB {
             // 分批导入：新版 KakaoTalk 退出时会清零 TalkUserDB 尾部页（好友库可从服务器重建），
             // 单条 INSERT..SELECT 全表扫描撞坏页会整体回滚；分批后仅损失最后一批（实机可抢救 400+ 行）
             const BATCH = 200;
+            const MAX_BATCH = 2000; // 硬上限 40 万行：防御异常数据导致死循环（正常好友数远低于此）
             let importedUsers = 0;
             let partial = false;
-            for (let off = 0; ; off += BATCH) {
+            for (let off = 0, batch = 0; batch < MAX_BATCH; off += BATCH, batch++) {
               const before = udb.query('SELECT COUNT(*) AS c FROM NTUser')[0].c;
               try {
                 udb.exec(`
@@ -340,6 +369,7 @@ export class KakaoDB {
               }
               const after = udb.query('SELECT COUNT(*) AS c FROM NTUser')[0].c;
               importedUsers += after - before;
+              if (batch % 5 === 4) report('ingest', `导入 ${edb.name}：好友已导入 ${importedUsers} 条…`);
               if (after - before < 1) break; // 本批无新增 = 已到末尾
             }
             if (partial) report('warn', `好友库被 KakaoTalk 部分清零，已抢救 ${importedUsers} 条（其余需重新登录 KakaoTalk 同步后恢复）`);

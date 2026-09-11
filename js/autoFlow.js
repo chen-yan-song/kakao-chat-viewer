@@ -310,7 +310,14 @@ async function decryptSnapshotAndOpen(st) {
   const winUserId = `sqlcipher-${String(dec.params.keyHex || 'cache').slice(0, 16)}`;
   // materials 存在即走「已解密文件」分支；devId 仅作统一库本地加密盐（自洽即可）
   const ok = await controls.tryOpenWindows(dec.files, winUserId, { materials: [], devId: 'win-snapshot' });
-  if (!ok) return false;
+  if (!ok) {
+    // openWindowsDatabase 把详细原因存在 __lastOpenError（手动区错误在自动面板不可见）
+    const why = window.__lastOpenError || '未知原因';
+    let logPath = '';
+    try { logPath = await app.getLogPath(); } catch { /* 忽略 */ }
+    setStep('decrypt', 'fail', `汇总失败：${why}${logPath ? `（日志文件：${logPath}）` : ''}`);
+    return false;
+  }
   setStep('decrypt', 'ok', `汇总完成（数据为 ${st.snapshotAt ? new Date(st.snapshotAt).toLocaleString() : '上次'} 的快照），正在加载聊天记录…`);
   if (inElectron()) window.kakaoApp.log('[auto] Windows 两步流完成');
   return true;
@@ -347,7 +354,12 @@ async function legacyWindowsDecrypt(disc, candidates) {
   // SQLCipher 路线无 userId：用密钥哈希作派生种子（仅需自洽，统一库密钥与源库无关）
   const winUserId = dec.params.userId || `sqlcipher-${String(dec.params.keyHex || 'mem').slice(0, 16)}`;
   const ok = await controls.tryOpenWindows(dec.files, winUserId, disc);
-  if (!ok) return false; // 错误详情由 openWindowsDatabase 呈现
+  if (!ok) {
+    // 错误详情由 openWindowsDatabase 记录到 __lastOpenError（手动区错误在自动面板不可见）
+    const why = window.__lastOpenError || '未知原因';
+    setStep('decrypt', 'fail', `汇总失败：${why}`);
+    return false;
+  }
 
   setStep('decrypt', 'ok', '汇总完成，正在加载聊天记录…');
   if (inElectron()) window.kakaoApp.log('[auto] Windows 全部步骤完成');
