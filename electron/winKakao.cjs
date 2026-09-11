@@ -365,7 +365,9 @@ while ($true) {
 $fs.Close()
 Write-Output ("DUMPSTATS commit=$commitCount matched=$matchedCount bytes=$totalBytes regions=$matchedCount")
 `;
-  fs.writeFileSync(ps1, script, 'utf8');
+  // 必须带 BOM：Windows PowerShell 5.1 对无 BOM 文件按系统 ANSI(GBK) 解析，
+  // 中文注释会被错误解码吞掉后续字符，导致脚本解析失败（ParserError: UnexpectedToken）
+  fs.writeFileSync(ps1, '\ufeff' + script, 'utf8');
   return ps1;
 }
 
@@ -381,13 +383,23 @@ function dumpProcessMemory(pid, timeoutMs = 300000, { privateOnly = false } = {}
     const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-TargetPid', String(pid), '-OutFile', dumpPath];
     if (privateOnly) args.push('-PrivateOnly');
     const child = spawn('powershell.exe', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '';
-    let stdout = '';
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    const stderrChunks = [];
+    const stdoutChunks = [];
+    child.stdout.on('data', (d) => { stdoutChunks.push(d); });
+    child.stderr.on('data', (d) => { stderrChunks.push(d); });
     const timer = setTimeout(() => { try { child.kill(); } catch { /* 忽略 */ } }, timeoutMs);
     child.on('close', (code) => {
       clearTimeout(timer);
+      let stdout;
+      let stderr;
+      try {
+        // Windows PowerShell 5.1 输出为系统 OEM(中文系统=GBK)，按 GBK 解码避免报错乱码
+        stdout = new TextDecoder('gbk').decode(Buffer.concat(stdoutChunks));
+        stderr = new TextDecoder('gbk').decode(Buffer.concat(stderrChunks));
+      } catch {
+        stdout = Buffer.concat(stdoutChunks).toString();
+        stderr = Buffer.concat(stderrChunks).toString();
+      }
       const m = stdout.match(/DUMPSTATS commit=(\d+) matched=(\d+) bytes=(\d+)(?: regions=(\d+))?/);
       const dumpStats = m
         ? { commit: Number(m[1]), matched: Number(m[2]), bytes: Number(m[3]), regions: m[4] ? Number(m[4]) : null }
