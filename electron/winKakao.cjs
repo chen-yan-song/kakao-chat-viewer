@@ -1059,6 +1059,7 @@ async function scanMemoryForKeys(pids, probeHeads, probeInfo, report, stats) {
     }
     if (!dump.ok) {
       report('warn', `PID ${pid} 内存导出失败：${dump.reason}`);
+      stats.dumpErrors.push(`PID ${pid}: ${String(dump.reason).slice(0, 300)}`);
       continue;
     }
     stats.pids.push(pid);
@@ -1091,13 +1092,14 @@ async function scanMemoryForKeys(pids, probeHeads, probeInfo, report, stats) {
 
 /** 构建统计对象与最终失败 reason */
 function newScanStats(pidsFound, probeInfo) {
-  return { pidsFound, pids: [], dumpMB: 0, dumpStats: null, probeInfo, hexWrapped: 0, hexBare: 0, binScanned: 0, binCandidates: 0, rounds: [] };
+  return { pidsFound, pids: [], dumpMB: 0, dumpStats: null, probeInfo, hexWrapped: 0, hexBare: 0, binScanned: 0, binCandidates: 0, rounds: [], dumpErrors: [] };
 }
 function scanFailReason(stats) {
   const dstat = stats.dumpStats
     ? `，提交区 ${stats.dumpStats.commit}/命中 ${stats.dumpStats.matched}/bytes ${stats.dumpStats.bytes || 0}${stats.dumpStats.regions != null ? `/region ${stats.dumpStats.regions}` : ''}`
     : '';
-  return `内存中未找到有效 SQLCipher 密钥（发现进程 ${stats.pidsFound} 个/成功导出 [${stats.pids.join(',') || '无'}]，导出内存 ${stats.dumpMB}MB${dstat}，探针[${stats.probeInfo.join(' ')}]，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`;
+  const dumpErr = stats.dumpErrors.length ? `，导出失败详情=[${stats.dumpErrors.join(' | ')}]` : '';
+  return `内存中未找到有效 SQLCipher 密钥（发现进程 ${stats.pidsFound} 个/成功导出 [${stats.pids.join(',') || '无'}]，导出内存 ${stats.dumpMB}MB${dstat}${dumpErr}，探针[${stats.probeInfo.join(' ')}]，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`;
 }
 
 /**
