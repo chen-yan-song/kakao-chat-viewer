@@ -424,15 +424,18 @@ async function extractUserIdFromMemory(timeoutMs = 300000) {
   const dump = await dumpProcessMemory(pids[0], timeoutMs);
   if (!dump.ok) return { ok: false, candidates: [], reason: dump.reason };
   try {
-    const candidates = scanDumpForUserId(dump.dumpPath);
+    const candidates = await scanDumpForUserId(dump.dumpPath);
     return { ok: candidates.length > 0, candidates, dumpPath: dump.dumpPath };
   } catch (e) {
     return { ok: false, candidates: [], reason: '内存分析失败：' + e.message };
   }
 }
 
+/** 让出事件循环：长时间同步计算会阻塞 Electron 主进程导致窗口"无响应"，重循环分片调用 */
+const yieldLoop = () => new Promise((r) => setImmediate(r));
+
 /** 流式扫描 dump 文件，跑四种 userId 正则并加权 */
-function scanDumpForUserId(dumpPath) {
+async function scanDumpForUserId(dumpPath) {
   const counts = { from: new Map(), user_id: new Map(), nt: new Map(), equal: new Map() };
   const fd = fs.openSync(dumpPath, 'r');
   const size = fs.fstatSync(fd).size;
@@ -452,6 +455,7 @@ function scanDumpForUserId(dumpPath) {
         if (n !== '0') counts[key].set(n, (counts[key].get(n) || 0) + 1);
       }
     }
+    await yieldLoop();
   }
   fs.closeSync(fd);
   try { fs.unlinkSync(dumpPath); } catch { /* 清理失败不阻塞 */ }
@@ -691,7 +695,7 @@ const SQLITE_HEAD_BUF = Buffer.from(SQLITE_HEAD, 'latin1');
  * 流式扫描 dump 提取 SQLCipher raw key 候选（64 位 hex）。
  * 优先 x'…' 包装形式（SQLCipher PRAGMA key 原始格式）；includeBare=true 时扩大到裸 64hex。
  */
-function scanDumpForRawKeys(dumpPath, { includeBare = false, maxKeys = 200000 } = {}) {
+async function scanDumpForRawKeys(dumpPath, { includeBare = false, maxKeys = 200000 } = {}) {
   const wrapped = new Set();
   const bare = new Set();
   const WRAP_RE = /x'([0-9a-fA-F]{64})'/g;
@@ -715,6 +719,7 @@ function scanDumpForRawKeys(dumpPath, { includeBare = false, maxKeys = 200000 } 
       }
     }
     if (wrapped.size + bare.size > maxKeys) break;
+    await yieldLoop();
   }
   fs.closeSync(fd);
   return { keys: [...wrapped, ...bare], wrappedCount: wrapped.size };
@@ -753,7 +758,7 @@ function trySqlCipherParams(edbBuf, keyBytes) {
  * SQLCipher 页级解密：每页 [密文 data][IV][HMAC] → 明文页尾补零（保留区），
  * 页1 前部 16 字节盐明文还原为 SQLite 头。产物可被标准 SQLite/SQLCipher 打开。
  */
-function decryptSqlCipherEdb(buf, keyBytes, pageSize, hmacSize) {
+async function decryptSqlCipherEdb(buf, keyBytes, pageSize, hmacSize) {
   const dataLen = pageSize - 16 - hmacSize;
   const pages = Math.floor(buf.length / pageSize);
   const out = Buffer.alloc(pages * pageSize);
@@ -772,6 +777,7 @@ function decryptSqlCipherEdb(buf, keyBytes, pageSize, hmacSize) {
     const dec = Buffer.concat([d.update(buf.subarray(start, start + len)), d.final()]);
     dec.copy(out, base + (p === 0 ? 16 : 0));
     if (p === 0) out[20] = 0; // 关键：清零 SQLite header byte 20（reserved space），SQLCipher 把它当 codec 保留（=80），plain SQLite 必须为 0
+    if ((p & 511) === 511) await yieldLoop(); // 大库（如 emoticon 数百 MB）分片让出事件循环
   }
   return out;
 }
@@ -838,7 +844,7 @@ function pickSqlCipherProbes(edbsDesc, max = 3) {
  * @param {Array<{name:string,buf:Buffer}>} probes 探针页1头部（≥ pageSize）
  * @returns {{candidates:Array<{keyHex:string,probe:string,pageSize:number,hmacSize:number}>, scanned:number, filtered:number}}
  */
-function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 64]], maxCandidates = 50000, onProgress } = {}) {
+async function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 64]], maxCandidates = 50000, onProgress } = {}) {
   const checks = [];
   for (const p of probes) {
     for (const [pageSize, hmacSize] of variants) {
@@ -888,7 +894,9 @@ function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 
       else filtered++;
     }
     scanned += offsets.length;
+    let winCount = 0;
     for (const i of offsets) {
+      if ((++winCount & 8191) === 0) await yieldLoop(); // 每 8192 窗口让出一次，防 UI 冻结
       const keyBytes = buf.subarray(i, i + 32);
       // 多样性检查：32 字节内不同字节数 ≥ 18（kakaocli-win 经验：堆元数据/指针域通不过此阈）
       const uniq = new Uint8Array(256);
@@ -919,17 +927,19 @@ function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 
       lastReport = off;
       onProgress(scanned, Math.min(off + CHUNK, size), size);
     }
+    await yieldLoop();
   }
   fs.closeSync(fd);
   return { candidates, scanned, filtered };
 }
 
 /** hex 候选密钥在探针上验证（解密头特征），返回全部命中 [{keyHex,pageSize,hmacSize,probe}] */
-function verifyHexKeys(keys, probeHeads, report, label) {
+async function verifyHexKeys(keys, probeHeads, report, label) {
   const hits = [];
   let tried = 0;
   for (const hex of keys) {
     tried++;
+    if (tried % 2000 === 0) await yieldLoop();
     if (tried % 5000 === 0) report('solve', `${label}：已验证 ${tried}/${keys.length} 个密钥候选…`);
     const keyBytes = Buffer.from(hex, 'hex');
     for (const p of probeHeads) {
@@ -953,14 +963,14 @@ const SQLCIPHER_VARIANTS = [[4096, 64], [4096, 32], [4096, 0], [1024, 64], [1024
  * 每轮候选先 HMAC 精验再解密特征确认，双保险排除误报；
  * 返回该轮全部真 key（不同 EDB 可能用不同 key，需全部收集）。
  */
-function runBinaryRounds(dumpPath, probeHeads, report, stats) {
+async function runBinaryRounds(dumpPath, probeHeads, report, stats) {
   const rounds = [
     { label: '二进制扫描（步进4，SQLCipher 4 全部 6 种参数变体）', step: 4, probes: probeHeads },
     { label: '二进制扫描（步进1，6 种参数变体，首探针）', step: 1, probes: probeHeads.slice(0, 1) },
   ];
   for (const r of rounds) {
     report('solve', `${r.label}…`);
-    const { candidates, scanned } = scanDumpForBinaryKeys(dumpPath, r.probes, {
+    const { candidates, scanned } = await scanDumpForBinaryKeys(dumpPath, r.probes, {
       step: r.step,
       variants: SQLCIPHER_VARIANTS,
       onProgress: (n, doneBytes, total) => {
@@ -985,7 +995,7 @@ function runBinaryRounds(dumpPath, probeHeads, report, stats) {
 }
 
 /** 命中密钥集解密全部 EDB（各库可能 key/页参数不同，逐库在密钥集上自适应验证） */
-function decryptWithSqlCipherKeys(hits, usable, report) {
+async function decryptWithSqlCipherKeys(hits, usable, report) {
   report('found', `SQLCipher 密钥命中 ${hits.length} 把：${hits.map((h) => `${h.keyHex.slice(0, 12)}…(${h.probe})`).join('、')}`);
   const files = [];
   let skipped = 0;
@@ -1012,7 +1022,7 @@ function decryptWithSqlCipherKeys(hits, usable, report) {
         const params = trySqlCipherParams(buf, keyBytes) ||
           (verifySqlCipherHmac(buf, keyBytes, hit.pageSize, hit.hmacSize) ? { pageSize: hit.pageSize, hmacSize: hit.hmacSize } : null);
         if (!params) continue;
-        const out = decryptSqlCipherEdb(buf, keyBytes, params.pageSize, params.hmacSize);
+        const out = await decryptSqlCipherEdb(buf, keyBytes, params.pageSize, params.hmacSize);
         if (out.subarray(0, 16).equals(SQLITE_HEAD_BUF)) {
           plain = out;
           usedKeys.add(hit.keyHex);
@@ -1081,18 +1091,18 @@ async function scanMemoryForKeys(pids, probeHeads, probeInfo, report, stats) {
     report('solve', `内存导出完成（${(dumpSize / 1048576).toFixed(0)} MB），开始扫描密钥…`);
     try {
       // 轮1：hex 文本形态密钥（x'' 包装优先，再裸 64hex），秒级
-      let scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: false });
+      let scan = await scanDumpForRawKeys(dump.dumpPath, { includeBare: false });
       stats.hexWrapped = scan.keys.length;
-      let hits = verifyHexKeys(scan.keys, probeHeads, report, '包装密钥');
+      let hits = await verifyHexKeys(scan.keys, probeHeads, report, '包装密钥');
       if (!hits.length) {
-        scan = scanDumpForRawKeys(dump.dumpPath, { includeBare: true });
+        scan = await scanDumpForRawKeys(dump.dumpPath, { includeBare: true });
         stats.hexBare = scan.keys.length;
-        hits = verifyHexKeys(scan.keys, probeHeads, report, '全量 hex 候选');
+        hits = await verifyHexKeys(scan.keys, probeHeads, report, '全量 hex 候选');
       }
       // 轮2：二进制窗口扫描（key 不以文本形态存在时）
       if (!hits.length) {
         report('solve', '内存中未发现文本形态密钥，开始二进制窗口扫描（约 2-6 分钟，请耐心等待）…');
-        hits = runBinaryRounds(dump.dumpPath, probeHeads, report, stats);
+        hits = await runBinaryRounds(dump.dumpPath, probeHeads, report, stats);
       }
       if (hits.length) return hits;
     } finally {
@@ -1145,7 +1155,7 @@ async function trySqlCipherFromMemory(edbs, onProgress) {
   if (hits.length) {
     const added = addKeysToCache(hits);
     report('found', `命中 ${hits.length} 把密钥（新入库 ${added} 把），开始解密…`);
-    const dec = decryptWithSqlCipherKeys(hits, usable, report);
+    const dec = await decryptWithSqlCipherKeys(hits, usable, report);
     if (dec.ok) return dec;
     report('warn', `${dec.reason}，继续扫描其它进程/轮次…`);
   }
@@ -1198,7 +1208,7 @@ async function decryptWithCachedKeys(edbs, onProgress, extraHits = []) {
   const usable = (edbs || []).filter((e) => (e.size == null ? true : e.size >= 4096));
   if (!usable.length) return { ok: false, reason: '没有可解密的 EDB 文件' };
   report('solve', `使用 ${hits.length} 把已缓存密钥解密 ${usable.length} 个 EDB…`);
-  return decryptWithSqlCipherKeys(hits, usable, report);
+  return await decryptWithSqlCipherKeys(hits, usable, report);
 }
 
 /* ============ 汇总：Windows 自动发现 ============ */
@@ -1255,7 +1265,7 @@ async function decryptAllEdbs(edbs, materials, userIdCandidates, onProgress) {
     const coreReadable = sorted.some((e) => isCoreEdbName(e.name) && probeEdbState(e).state === 'ok');
     if (coreReadable) {
       report('solve', `发现 ${cachedKeys.length} 把已缓存密钥，尝试直接解密…`);
-      const fast = decryptWithSqlCipherKeys(cachedKeys, sorted.filter((e) => (e.size == null ? true : e.size >= 4096)), report);
+      const fast = await decryptWithSqlCipherKeys(cachedKeys, sorted.filter((e) => (e.size == null ? true : e.size >= 4096)), report);
       if (fast.ok) return fast;
       report('warn', `缓存密钥未能解密（${fast.reason}），继续尝试材料/内存路线…`);
     }
