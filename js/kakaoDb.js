@@ -165,14 +165,16 @@ export class KakaoDB {
     }
 
     // 依次尝试不同的兼容模式 / 页面大小组合（对齐 kakaocli 的做法）
+    // compat 4 优先：KakaoTalk 新版库与自建统一库均为 SQLCipher 4，一次命中；
+    // 每次失败尝试都要重跑 PBKDF2 派生（25.6万轮 SHA-512），低配机上每次数秒，顺序直接决定等待时长
     report('decrypt', '解密数据库…');
     const attempts = [
-      { compat: 3, pageSize: null },
-      { compat: 3, pageSize: 1024 },
-      { compat: 3, pageSize: 4096 },
       { compat: 4, pageSize: null },
       { compat: 4, pageSize: 4096 },
       { compat: 4, pageSize: 1024 },
+      { compat: 3, pageSize: null },
+      { compat: 3, pageSize: 1024 },
+      { compat: 3, pageSize: 4096 },
     ];
 
     let lastError = null;
