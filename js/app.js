@@ -31,6 +31,7 @@ const el = {
   autoMsg: $('autoMsg'),
   autoRetryBtn: $('autoRetryBtn'),
   autoManualBtn: $('autoManualBtn'),
+  autoContinueBtn: $('autoContinueBtn'),
   // 手动配置
   uuidInput: $('uuidInput'),
   userIdInput: $('userIdInput'),
@@ -1383,6 +1384,7 @@ function resetAutoSteps() {
   el.autoMsg.hidden = true;
   el.autoMsg.textContent = '';
   el.autoRetryBtn.hidden = true;
+  if (el.autoContinueBtn) el.autoContinueBtn.hidden = true;
   el.autoPanel.hidden = false;
   el.autoPanel.querySelector('.auto-progress').hidden = false;
 }
@@ -1400,6 +1402,27 @@ function setAutoStep(name, status, detail) {
 function showAutoMsg(msg) {
   el.autoMsg.textContent = msg;
   el.autoMsg.hidden = false;
+}
+
+/**
+ * 两步流用户确认：显示引导文案 + 「我已操作，继续」按钮，返回 Promise（点击后 resolve）
+ * 用于 Windows 新版 KakaoTalk 保护下的两步流（退出→快照 / 启动→取密钥）。
+ */
+function waitAutoContinue(guideText, btnText) {
+  return new Promise((resolve) => {
+    showAutoMsg(guideText);
+    const btn = el.autoContinueBtn;
+    btn.textContent = btnText || '我已操作，继续';
+    btn.hidden = false;
+    el.autoPanel.querySelector('.auto-progress').hidden = true; // 等待用户时停掉假进度条
+    const handler = () => {
+      btn.hidden = true;
+      btn.removeEventListener('click', handler);
+      el.autoPanel.querySelector('.auto-progress').hidden = false;
+      resolve();
+    };
+    btn.addEventListener('click', handler);
+  });
 }
 
 /** 把自动发现结果写入 state（复用手动模式的主库匹配/渲染逻辑） */
@@ -1434,6 +1457,7 @@ registerAuto({
   tryOpenDatabase: openDatabase,
   tryOpenWindows: openWindowsDatabase,
   autoMsg: showAutoMsg,
+  waitConfirm: waitAutoContinue,
 });
 
 /** 启动入口：App 内自动流程，浏览器手动模式 */

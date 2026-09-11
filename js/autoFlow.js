@@ -144,8 +144,12 @@ export async function runAutoFlow() {
 }
 
 /**
- * Windows 全自动流程：注册表设备材料 → EDB 清单 → userId 还原（文件扫描/内存提取）→
- * 参数求解 → 按页 AES 解密 → 汇总统一库
+ * Windows 全自动流程：注册表设备材料 → EDB 清单 → 两步流编排 → 解密 → 汇总统一库
+ *
+ * 两步流背景（2026-09 实机验证）：新版 KakaoTalk 运行时把核心 EDB 锁死且磁盘全零，
+ * 完全退出后才真实落盘；而解密密钥只在运行时驻留内存。因此必须分两步：
+ *   退出态：复制 EDB 快照 + 缓存探针 → 运行态：内存取密钥 → 用快照解密。
+ * 密钥缓存后，日常使用只需「退出 KakaoTalk」一次即可解密最新数据。
  */
 async function runAutoFlowWindows() {
   const app = window.kakaoApp;
@@ -173,41 +177,148 @@ async function runAutoFlowWindows() {
   }
   const totalMB = disc.edbs.reduce((s, f) => s + (f.size || 0), 0) / 1024 / 1024;
   setStep('plist', 'ok', `找到 ${disc.edbs.length} 个 EDB 文件（共 ${totalMB.toFixed(1)} MB）`);
-  if (disc.running) {
-    controls.autoMsg('检测到 KakaoTalk 正在运行：将同时从进程内存提取用户 ID（成功率更高）；若记录不全请退出 KakaoTalk 后重新检测。');
-  }
 
-  // ---- 步骤 3：userId 还原 ----
-  setStep('uid', 'active', '正在还原用户 ID…');
-  let candidates = (disc.userIdCandidates || []).map((c) => c.num);
-  if (candidates.length) {
-    setStep('uid', 'active', `文件扫描候选：${candidates.join(', ')}`);
-  }
-  if (disc.running) {
-    setStep('uid', 'active', 'KakaoTalk 运行中：正在导出进程内存并提取用户 ID（可能需要 1-3 分钟）…');
-    try {
-      const mem = await app.winUserIdFromMemory();
-      if (mem.ok) {
-        const nums = mem.candidates.map((c) => c.num);
-        candidates = [...new Set([...nums, ...candidates])];
-        setStep('uid', 'active', `内存提取候选：${nums.join(', ')}（结合文件扫描共 ${candidates.length} 个）`);
-      }
-    } catch (e) {
-      setStep('uid', 'active', `内存提取失败（${e.message}），继续用文件扫描候选…`);
-    }
-  }
-  if (!candidates.length) {
-    // 新版 SQLCipher 路线无需 userId：不中断，继续解密（旧算法路线无候选必然不命中，会自动转 SQLCipher 内存密钥路线）
-    setStep('uid', 'active', '未自动还原用户 ID——不影响新版 SQLCipher 解密（无需 userId），继续…');
-  }
+  // ---- 步骤 3：userId 候选（仅文件扫描；SQLCipher 路线不需要 userId，跳过耗时的内存提取）----
+  const candidates = (disc.userIdCandidates || []).map((c) => c.num);
+  setStep('uid', 'active', '正在检测 KakaoTalk 数据保护状态…');
 
-  // ---- 步骤 4：参数求解 + 解密 ----
-  setStep('db', 'ok', `已定位 ${disc.edbs.length} 个 EDB 文件`);
+  // ---- 步骤 4/5：两步流状态机编排（最多 4 轮用户引导，防死循环）----
   if (app.onWinProgress) {
     app.onWinProgress(({ detail }) => {
       setStep('decrypt', 'active', detail);
     });
   }
+  setStep('db', 'ok', `已定位 ${disc.edbs.length} 个 EDB 文件`);
+
+  for (let round = 0; round < 4; round++) {
+    let st;
+    try {
+      st = await app.winTwoStepStatus();
+    } catch (e) {
+      setStep('uid', 'warn', `状态检测失败（${e.message}），回退传统解密流程…`);
+      return legacyWindowsDecrypt(disc, candidates);
+    }
+    const stDesc = `运行中=${st.running ? '是' : '否'}，可读库 ${st.readable}/${st.coreCount}，已存密钥 ${st.keyCount}，快照 ${st.snapshotCount}`;
+    setStep('uid', 'active', `保护状态检测：${stDesc}`);
+
+    // A. 文件可读且有密钥：直接解密最新落盘数据
+    if (st.advice === 'decrypt-now') {
+      setStep('uid', 'ok', `已缓存 ${st.keyCount} 把密钥，数据文件可读`);
+      return legacyWindowsDecrypt(disc, candidates);
+    }
+
+    // B. 有密钥有快照：直接解密快照
+    if (st.advice === 'decrypt-snapshot') {
+      setStep('uid', 'ok', `已缓存 ${st.keyCount} 把密钥`);
+      const ok = await decryptSnapshotAndOpen(st);
+      if (ok) return true;
+      // 快照解密失败（key 可能已轮换）：清一轮重试
+      setStep('decrypt', 'warn', '快照解密失败，重新检测状态…');
+      continue;
+    }
+
+    // C. 文件可读但无密钥：先快照，再引导启动 KakaoTalk 取密钥
+    if (st.advice === 'snapshot') {
+      setStep('db', 'active', '正在复制数据快照（KakaoTalk 退出态，仅一次机会窗口）…');
+      const snap = await app.winSnapshot();
+      if (!snap.ok) {
+        setStep('db', 'fail', '快照复制失败：核心库均不可读');
+        return false;
+      }
+      setStep('db', 'ok', `快照完成：${snap.count} 个核心库（含未落盘的 WAL 数据）`);
+      await controls.waitConfirm(
+        '数据快照已保存。现在请：\n① 启动 KakaoTalk 并完成登录\n② 点开左侧「聊天」列表\n③ 逐个进入你需要导出的聊天室（每个房间密钥独立，进入过才会驻留内存）\n完成后点击下方按钮。',
+        '已完成，开始提取密钥');
+      setStep('decrypt', 'active', '正在从 KakaoTalk 进程内存提取解密密钥（约 2-5 分钟）…');
+      const ck = await app.winCollectKeys({ edbs: disc.edbs });
+      if (!ck.ok) {
+        setStep('decrypt', 'fail', ck.detail || ck.reason);
+        return false;
+      }
+      setStep('uid', 'ok', `密钥提取完成（命中 ${ck.hits.length} 把，累计缓存 ${ck.keyCount} 把）`);
+      const ok = await decryptSnapshotAndOpen(st);
+      if (ok) return true;
+      return false;
+    }
+
+    // D. 运行中、有探针缓存、无密钥：确认登录状态后直接取密钥
+    if (st.advice === 'collect-keys') {
+      if (!st.running) {
+        await controls.waitConfirm(
+          '请启动 KakaoTalk 并完成登录，点开「聊天」列表和需要导出的聊天室。完成后点击下方按钮。',
+          '已启动并登录');
+        continue;
+      }
+      await controls.waitConfirm(
+        'KakaoTalk 运行中。请确认：已登录，且已点开「聊天」列表和需要导出的聊天室（密钥只在打开过的房间驻留内存）。',
+        '已确认，开始提取密钥');
+      setStep('decrypt', 'active', '正在从 KakaoTalk 进程内存提取解密密钥（约 2-5 分钟）…');
+      const ck = await app.winCollectKeys({ edbs: disc.edbs });
+      if (!ck.ok) {
+        if (ck.reason === 'edb-protected') {
+          // 探针缓存也失效：必须重新走退出态快照
+          setStep('decrypt', 'warn', ck.detail);
+          await controls.waitConfirm(
+            '需要刷新数据探针。请完全退出 KakaoTalk（右键托盘图标 → 退出，不是关窗口）。',
+            '已完全退出 KakaoTalk');
+          continue;
+        }
+        setStep('decrypt', 'fail', ck.detail || ck.reason);
+        return false;
+      }
+      setStep('uid', 'ok', `密钥提取完成（命中 ${ck.hits.length} 把，累计缓存 ${ck.keyCount} 把）`);
+      // 有快照则直接解密；无快照引导退出落盘
+      const st2 = await app.winTwoStepStatus();
+      if (st2.hasSnapshot) {
+        const ok = await decryptSnapshotAndOpen(st2);
+        if (ok) return true;
+        return false;
+      }
+      await controls.waitConfirm(
+        '密钥已保存。现在请完全退出 KakaoTalk（右键托盘图标 → 退出），让聊天数据落盘。',
+        '已完全退出 KakaoTalk');
+      continue;
+    }
+
+    // E. 什么都没有/文件被保护：引导退出 KakaoTalk
+    if (st.advice === 'exit-kakao') {
+      await controls.waitConfirm(
+        '新版 KakaoTalk 运行时会锁死并清空数据文件（反取证保护）。\n请完全退出 KakaoTalk：右键右下角托盘图标 → 「退出」（仅关窗口无效）。',
+        '已完全退出 KakaoTalk');
+      continue;
+    }
+  }
+  setStep('decrypt', 'fail', '两步流编排超出最大轮次，请点击「重新自动检测」重试');
+  return false;
+}
+
+/** 解密已有快照并打开统一库 */
+async function decryptSnapshotAndOpen(st) {
+  const app = window.kakaoApp;
+  const snap = await app.winSnapshotEdbs();
+  if (!snap.ok) {
+    setStep('decrypt', 'fail', '快照为空，请重新检测');
+    return false;
+  }
+  setStep('decrypt', 'active', `用已缓存密钥解密快照（${snap.edbs.length} 个库，快照时间 ${st.snapshotAt || '未知'}）…`);
+  const dec = await app.winDecryptCached({ edbs: snap.edbs });
+  if (!dec.ok) {
+    setStep('decrypt', 'fail', dec.reason);
+    return false;
+  }
+  setStep('decrypt', 'active', `解密成功 ${dec.files.length} 个 EDB，正在汇总为统一查询库…`);
+  const winUserId = `sqlcipher-${String(dec.params.keyHex || 'cache').slice(0, 16)}`;
+  // materials 存在即走「已解密文件」分支；devId 仅作统一库本地加密盐（自洽即可）
+  const ok = await controls.tryOpenWindows(dec.files, winUserId, { materials: [], devId: 'win-snapshot' });
+  if (!ok) return false;
+  setStep('decrypt', 'ok', `汇总完成（数据为 ${st.snapshotAt ? new Date(st.snapshotAt).toLocaleString() : '上次'} 的快照），正在加载聊天记录…`);
+  if (inElectron()) window.kakaoApp.log('[auto] Windows 两步流完成');
+  return true;
+}
+
+/** 传统路径：材料派生 → SQLCipher 内存恢复 → 解密（decryptAllEdbs 内部含缓存密钥快速通道） */
+async function legacyWindowsDecrypt(disc, candidates) {
+  const app = window.kakaoApp;
   setStep('decrypt', 'active', '求解解密参数并按页解密 EDB…');
   let dec;
   try {
@@ -221,13 +332,13 @@ async function runAutoFlowWindows() {
     return false;
   }
   if (!dec.ok) {
-    setStep('decrypt', 'fail', dec.reason);
+    setStep('decrypt', 'fail', dec.detail || dec.reason);
     return false;
   }
   const isSqlcipher = dec.params.kind === 'sqlcipher';
   if (isSqlcipher) {
     const kc = dec.params.keyCount > 1 ? `（共 ${dec.params.keyCount} 把密钥）` : '';
-    setStep('uid', 'ok', `SQLCipher 密钥已从进程内存恢复${kc}（新版加密，无需 userId）`);
+    setStep('uid', 'ok', `SQLCipher 密钥已恢复${kc}（新版加密，无需 userId）`);
   } else {
     setStep('uid', 'ok', `用户 ID ${dec.params.userId}（已由参数求解验证）`);
   }

@@ -314,15 +314,33 @@ export class KakaoDB {
             cols.some((x) => x.toLowerCase() === c.toLowerCase())
           );
           if (uidCol) {
-            udb.exec(`
-              INSERT OR IGNORE INTO NTUser (userId, displayName, nickName, friendNickName)
-              SELECT DISTINCT s.${qid(uidCol)},
-                     ${pick(['nickName', 'nickname', 'displayName', 'name'])},
-                     ${pick(['nickName', 'nickname'])},
-                     ${pick(['friendNickName', 'friendNickname'])}
-              FROM src.${qid(userTable)} s
-              WHERE s.${qid(uidCol)} IS NOT NULL
-            `);
+            // 分批导入：新版 KakaoTalk 退出时会清零 TalkUserDB 尾部页（好友库可从服务器重建），
+            // 单条 INSERT..SELECT 全表扫描撞坏页会整体回滚；分批后仅损失最后一批（实机可抢救 400+ 行）
+            const BATCH = 200;
+            let importedUsers = 0;
+            let partial = false;
+            for (let off = 0; ; off += BATCH) {
+              const before = udb.query('SELECT COUNT(*) AS c FROM NTUser')[0].c;
+              try {
+                udb.exec(`
+                  INSERT OR IGNORE INTO NTUser (userId, displayName, nickName, friendNickName)
+                  SELECT DISTINCT s.${qid(uidCol)},
+                         ${pick(['nickName', 'nickname', 'displayName', 'name'])},
+                         ${pick(['nickName', 'nickname'])},
+                         ${pick(['friendNickName', 'friendNickname'])}
+                  FROM src.${qid(userTable)} s
+                  WHERE s.${qid(uidCol)} IS NOT NULL
+                  LIMIT ${BATCH} OFFSET ${off}
+                `);
+              } catch (e) {
+                partial = true;
+                break; // 撞坏页：停止，已入库批次保留
+              }
+              const after = udb.query('SELECT COUNT(*) AS c FROM NTUser')[0].c;
+              importedUsers += after - before;
+              if (after - before < 1) break; // 本批无新增 = 已到末尾
+            }
+            if (partial) report('warn', `好友库被 KakaoTalk 部分清零，已抢救 ${importedUsers} 条（其余需重新登录 KakaoTalk 同步后恢复）`);
           }
         }
 

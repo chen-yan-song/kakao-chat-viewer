@@ -342,16 +342,21 @@ while ($true) {
   if ($firstDbg) { Write-Output ("DBG MBI sizeOf=" + [Runtime.InteropServices.Marshal]::SizeOf($mbi) + " firstBase=0x{0:X} firstSize={1} firstState=0x{2:X} firstProtect=0x{3:X} firstType=0x{4:X} addrPtr=0x{5:X}" -f [int64]$mbi.BaseAddress, $region, $mbi.State, $mbi.Protect, $mbi.Type, [int64]$addr); $firstDbg = $false }
   if ($mbi.State -eq 0x1000 -and $region -gt 0 -and $region -le 268435456) {
     $commitCount++
-    $matchedCount++
-    # 跟诊断脚本一致：直接 ReadProcessMemory + Write，靠 RPM 自身在 NOACCESS/EXECUTE-only 区域返回 false 保护
-    $remain = $region
-    $cur = [int64]$mbi.BaseAddress
-    while ($remain -gt 0) {
-      $take = [int][Math]::Min($remain, $buf.Length)
-      $ok = [KkvMem]::ReadProcessMemory($h, [IntPtr]$cur, $buf, $take, [ref]$read)
-      if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read); $totalBytes += $read }
-      $cur += $take
-      $remain -= $take
+    # PrivateOnly：仅导出 MEM_PRIVATE(0x20000) 堆内存（SQLCipher key 所在，体积可小 4 倍以上）。
+    # 注意：32 位 PowerShell/WOW64 下 MBI struct 截断导致 Type 恒为 0 → matched=0，
+    # 调用方检测到 matched=0 会回退全量导出，安全兜底（v2.0.5 教训，不能无条件依赖此过滤）。
+    if ((-not $PrivateOnly) -or ($mbi.Type -eq 0x20000)) {
+      $matchedCount++
+      # 跟诊断脚本一致：直接 ReadProcessMemory + Write，靠 RPM 自身在 NOACCESS/EXECUTE-only 区域返回 false 保护
+      $remain = $region
+      $cur = [int64]$mbi.BaseAddress
+      while ($remain -gt 0) {
+        $take = [int][Math]::Min($remain, $buf.Length)
+        $ok = [KkvMem]::ReadProcessMemory($h, [IntPtr]$cur, $buf, $take, [ref]$read)
+        if ($ok -and $read -gt 0) { $fs.Write($buf, 0, $read); $totalBytes += $read }
+        $cur += $take
+        $remain -= $take
+      }
     }
   }
   $addr = [IntPtr]([int64]$mbi.BaseAddress + $region)
@@ -441,6 +446,231 @@ function scanDumpForUserId(dumpPath) {
   return weightedUserId(counts);
 }
 
+/* ============ 两步流基础设施：探针缓存 / key 缓存 / EDB 快照 ============
+ * 背景（2026-09 实机验证）：新版 KakaoTalk 运行时核心 EDB 磁盘全零+排他锁，
+ * 完全退出后才真实落盘。因此流程拆为：退出态复制快照/探针 → 运行态内存取 key → 解密。
+ */
+
+let CACHE_DIR = null;
+/** 由 main 进程注入缓存目录（默认 ~/.kakao-chat-viewer） */
+function initCacheDir(dir) {
+  CACHE_DIR = dir;
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 忽略 */ }
+}
+function cacheDir() {
+  const d = CACHE_DIR || path.join(os.homedir(), '.kakao-chat-viewer');
+  try { fs.mkdirSync(d, { recursive: true }); } catch { /* 忽略 */ }
+  return d;
+}
+function loadJsonFile(name, fallback) {
+  try { return JSON.parse(fs.readFileSync(path.join(cacheDir(), name), 'utf8')); } catch { return fallback; }
+}
+function saveJsonFile(name, obj) {
+  try { fs.writeFileSync(path.join(cacheDir(), name), JSON.stringify(obj, null, 1)); } catch { /* 忽略 */ }
+}
+
+/** 内存命中的 SQLCipher key 缓存（数组：多库各自 key 全部保存，解密时逐库自适应） */
+function loadKeyCache() { return loadJsonFile('win-key-cache.json', []); }
+function addKeysToCache(hits) {
+  if (!hits || !hits.length) return 0;
+  const cache = loadKeyCache();
+  const seen = new Set(cache.map((h) => h.keyHex));
+  let added = 0;
+  for (const h of hits) {
+    if (!h.keyHex || seen.has(h.keyHex)) continue;
+    seen.add(h.keyHex);
+    cache.push({ keyHex: h.keyHex, pageSize: h.pageSize, hmacSize: h.hmacSize, probe: h.probe || '', updatedAt: new Date().toISOString() });
+    added++;
+  }
+  if (added) saveJsonFile('win-key-cache.json', cache);
+  return added;
+}
+
+/** 探针缓存：退出态读到的真实页1（前 4096 字节 hex），供运行态（文件全零/被锁）验证 key */
+function loadProbeCache() { return loadJsonFile('win-probe-cache.json', {}); }
+function updateProbeCache(name, headBuf, size) {
+  if (!headBuf || headBuf.length < 4096) return;
+  const cache = loadProbeCache();
+  cache[name] = { headHex: Buffer.from(headBuf.subarray(0, 4096)).toString('hex'), size: size || 0, updatedAt: new Date().toISOString() };
+  saveJsonFile('win-probe-cache.json', cache);
+}
+
+/** 核心聊天库判定（两步流只处理这些；emoticon 等大文件跳过） */
+function isCoreEdbName(name) {
+  return /^TalkUserDB\.edb$/i.test(name) || /^chatListInfo\.edb$/i.test(name) || /^chatLogs[_-]\d+\.edb$/i.test(name);
+}
+
+/**
+ * 探针状态检测：读取页1前 4096 字节并分类。
+ * ok=真实加密数据可读；zeroed=运行时全零保护；locked=排他锁/读取失败；short=不足一页
+ */
+function probeEdbState(edb) {
+  let buf = Buffer.alloc(0);
+  try {
+    buf = readEdbHead(edb, 4096);
+  } catch (e) {
+    return { state: 'locked', buf, error: e.code || e.message };
+  }
+  if (buf.length < 4096) return { state: 'short', buf };
+  for (let i = 0; i < 4096; i++) if (buf[i] !== 0) return { state: 'ok', buf };
+  return { state: 'zeroed', buf };
+}
+
+/**
+ * 构建验证探针集合：覆盖全部核心库（每库 key 独立），实时可读优先，全零/被锁回落探针缓存。
+ * 返回 { heads:[{name,buf,fromCache}], states:[{name,state,error?}] }
+ */
+function buildProbeHeads(edbs) {
+  const cache = loadProbeCache();
+  const heads = [];
+  const states = [];
+  for (const e of edbs) {
+    if (!isCoreEdbName(e.name)) continue;
+    if (e.size != null && e.size < 4096) { states.push({ name: e.name, state: 'short' }); continue; }
+    const st = probeEdbState(e);
+    states.push({ name: e.name, state: st.state, error: st.error });
+    if (st.state === 'ok') {
+      heads.push({ name: e.name, buf: st.buf, fromCache: false });
+      updateProbeCache(e.name, st.buf, e.size);
+    } else if (cache[e.name] && cache[e.name].headHex) {
+      heads.push({ name: e.name, buf: Buffer.from(cache[e.name].headHex, 'hex'), fromCache: true });
+    }
+  }
+  return { heads, states };
+}
+
+/* ---- WAL 重放：把未 checkpoint 的帧合并回主库镜像（加密态；取证用途，salt 过滤、不验校验和） ---- */
+function replayWal(mainBuf, walBuf) {
+  if (!walBuf || walBuf.length < 32) return { buf: mainBuf, applied: 0 };
+  const magic = walBuf.readUInt32BE(0);
+  if (magic !== 0x377f0682 && magic !== 0x377f0683) return { buf: mainBuf, applied: 0 };
+  const pageSize = walBuf.readUInt32BE(8);
+  if (pageSize <= 0 || mainBuf.length % pageSize !== 0) return { buf: mainBuf, applied: 0 };
+  const salt1 = walBuf.readUInt32BE(16);
+  const salt2 = walBuf.readUInt32BE(20);
+  const frameSize = 24 + pageSize;
+  const totalFrames = Math.floor((walBuf.length - 32) / frameSize);
+  const pages = new Map(); // pgno → 页数据（后写覆盖）
+  let dbsize = 0; // 最后一个 commit 帧声明的库大小（页）
+  let applied = 0;
+  for (let f = 0; f < totalFrames; f++) {
+    const off = 32 + f * frameSize;
+    const pgno = walBuf.readUInt32BE(off);
+    const commitSize = walBuf.readUInt32BE(off + 4);
+    // salt 不匹配 = checkpoint 前的旧帧，跳过
+    if (walBuf.readUInt32BE(off + 8) !== salt1 || walBuf.readUInt32BE(off + 12) !== salt2) continue;
+    if (pgno === 0) continue;
+    pages.set(pgno, walBuf.subarray(off + 24, off + 24 + pageSize));
+    applied++;
+    if (commitSize > 0) dbsize = commitSize;
+  }
+  if (applied === 0 || dbsize === 0) return { buf: mainBuf, applied: 0 };
+  const totalPages = Math.max(dbsize, mainBuf.length / pageSize);
+  const out = Buffer.alloc(totalPages * pageSize);
+  mainBuf.copy(out, 0, 0, Math.min(mainBuf.length, out.length));
+  for (const [pgno, data] of pages) {
+    if (pgno <= totalPages) data.copy(out, (pgno - 1) * pageSize);
+  }
+  return { buf: out.subarray(0, dbsize * pageSize), applied };
+}
+
+/** 读取 EDB 并合并未 checkpoint 的 WAL（有磁盘路径时；手动直传字节模式无 WAL 概念） */
+function readEdbWithWal(edb) {
+  const main = readEdbBuffer(edb);
+  if (!edb.path) return { buf: main, walApplied: 0 };
+  const walPath = edb.path + '-wal';
+  if (!fs.existsSync(walPath)) return { buf: main, walApplied: 0 };
+  let wal;
+  try { wal = fs.readFileSync(walPath); } catch { return { buf: main, walApplied: 0 }; }
+  const r = replayWal(main, wal);
+  return { buf: r.buf, walApplied: r.applied };
+}
+
+/** 退出态快照：复制核心库（含 -wal/-shm）到缓存目录 snapshot/，返回可用于解密的 edbs 描述 */
+function snapshotCoreEdbs(edbs) {
+  const dir = path.join(cacheDir(), 'snapshot');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 忽略 */ }
+  const out = [];
+  let copied = 0;
+  for (const e of edbs) {
+    if (!isCoreEdbName(e.name) || !e.path) continue;
+    const st = probeEdbState(e);
+    if (st.state !== 'ok') continue; // 全零/被锁时的快照无意义
+    const dst = path.join(dir, e.name);
+    try {
+      fs.copyFileSync(e.path, dst);
+      for (const suffix of ['-wal', '-shm']) {
+        const side = e.path + suffix;
+        if (fs.existsSync(side)) { try { fs.copyFileSync(side, dst + suffix); } catch { /* 忽略 */ } }
+        else { try { fs.unlinkSync(dst + suffix); } catch { /* 忽略 */ } } // 清掉旧快照的残留 wal
+      }
+      copied++;
+      out.push({ path: dst, name: e.name, size: e.size, userDir: e.userDir, chatId: e.chatId });
+      updateProbeCache(e.name, st.buf, e.size);
+    } catch { /* 单文件失败跳过 */ }
+  }
+  saveJsonFile('win-snapshot-meta.json', { createdAt: new Date().toISOString(), count: copied, names: out.map((o) => o.name) });
+  return { ok: copied > 0, count: copied, edbs: out, dir };
+}
+
+/** 读取已有快照（解密用） */
+function loadSnapshotEdbs() {
+  const meta = loadJsonFile('win-snapshot-meta.json', null);
+  if (!meta || !meta.count) return { ok: false, edbs: [] };
+  const dir = path.join(cacheDir(), 'snapshot');
+  const edbs = [];
+  for (const name of meta.names || []) {
+    const p = path.join(dir, name);
+    if (!fs.existsSync(p)) continue;
+    let size = 0;
+    try { size = fs.statSync(p).size; } catch { /* 忽略 */ }
+    const cm = name.match(/chatLogs[_-](\d+)\.edb$/i);
+    edbs.push({ path: p, name, size, userDir: null, chatId: cm ? cm[1] : null });
+  }
+  return { ok: edbs.length > 0, edbs, createdAt: meta.createdAt };
+}
+
+/**
+ * 两步流状态检测：决定 UI 下一步引导。
+ * advice: decrypt-now（有key且文件可读）/ snapshot（可读但无key，先快照）/ decrypt-snapshot（有key有快照）
+ *         / collect-keys（有探针，运行中正好取key）/ exit-kakao（先退出拿探针或落盘）
+ */
+async function winTwoStepStatus() {
+  const edbInfo = listEdbFiles();
+  const proc = await isKakaoTalkRunning();
+  const core = edbInfo.edbs.filter((e) => isCoreEdbName(e.name));
+  let readable = 0;
+  let zeroed = 0;
+  let locked = 0;
+  let short = 0;
+  for (const e of core) {
+    if (e.size != null && e.size < 4096) { short++; continue; }
+    const st = probeEdbState(e);
+    if (st.state === 'ok') { readable++; updateProbeCache(e.name, st.buf, e.size); }
+    else if (st.state === 'zeroed') zeroed++;
+    else if (st.state === 'locked') locked++;
+    else short++;
+  }
+  const keys = loadKeyCache();
+  const probes = loadProbeCache();
+  const snap = loadJsonFile('win-snapshot-meta.json', null);
+  const hasSnapshot = !!(snap && snap.count > 0);
+  let advice;
+  if (readable > 0 && keys.length > 0) advice = 'decrypt-now';
+  else if (readable > 0) advice = 'snapshot';
+  else if (keys.length > 0 && hasSnapshot) advice = 'decrypt-snapshot';
+  else if (keys.length > 0) advice = 'exit-kakao'; // 有 key 无快照：退出后落盘再解密
+  else if (Object.keys(probes).length > 0) advice = 'collect-keys'; // 有探针：运行中正好取 key
+  else advice = 'exit-kakao'; // 什么都没有：先退出拿探针
+  return {
+    running: proc.running, pids: proc.pids,
+    coreCount: core.length, readable, zeroed, locked, short,
+    keyCount: keys.length, probeCount: Object.keys(probes).length,
+    hasSnapshot, snapshotCount: snap ? snap.count : 0, snapshotAt: snap ? snap.createdAt : null,
+    advice,
+  };
+}
+
 /* ============ SQLCipher 4：内存 raw key 恢复（新版 KakaoTalk EDB）============ */
 
 const SQLITE_HEAD_BUF = Buffer.from(SQLITE_HEAD, 'latin1');
@@ -518,6 +748,10 @@ function decryptSqlCipherEdb(buf, keyBytes, pageSize, hmacSize) {
   SQLITE_HEAD_BUF.copy(out, 0);
   for (let p = 0; p < pages; p++) {
     const base = p * pageSize;
+    // 全零页（未写入的文件空洞）：SQLCipher 规范跳过解密直接视为零页，否则解出垃圾导致 SQLite malformed（真实 TalkUserDB 183 页中 119 页全零，实机踩坑）
+    let nonZero = -1;
+    for (let i = base; i < base + pageSize; i++) { if (buf[i] !== 0) { nonZero = i; break; } }
+    if (nonZero === -1) continue; // out 已 zero-filled，直接跳过
     const start = p === 0 ? 16 : base; // 页1 跳过明文盐
     const len = p === 0 ? dataLen - 16 : dataLen;
     const ivOff = base + pageSize - hmacSize - 16;
@@ -623,7 +857,9 @@ function scanDumpForBinaryKeys(dumpPath, probes, { step = 4, variants = [[4096, 
     if (got <= 32) break;
     const limit = Math.min(CHUNK - step, got - 32); // 与下一块无缝衔接（CHUNK 是 step 的倍数）
     // 向量化预过滤：单次 O(n) 扫描算 zero/printable 累加和，内层只查表 O(1)
-    const usableLen = limit + step; // 最远需要读到 limit+32-1
+    // 修复：必须是 limit + 32（原 limit + step）——内层读 prefix[i+32]，i 最大 limit，
+    // step<32 时原写法数组长度不足，越界得 undefined → NaN 比较为 false，块尾 32-step 字节的窗口被误过滤（实机踩坑）
+    const usableLen = limit + 32;
     const zeroPrefix = new Int32Array(usableLen + 1);
     const printablePrefix = new Int32Array(usableLen + 1);
     for (let i = 0; i < usableLen; i++) {
@@ -746,7 +982,17 @@ function decryptWithSqlCipherKeys(hits, usable, report) {
     const edb = usable[i];
     report('decrypt', `解密 ${edb.name}（${i + 1}/${usable.length}）…`);
     try {
-      const buf = readEdbBuffer(edb);
+      // 合并未 checkpoint 的 WAL（退出态复制的快照常带 WAL 残留，消息比主库新）
+      const { buf, walApplied } = readEdbWithWal(edb);
+      if (walApplied) report('decrypt', `${edb.name}：WAL 重放 ${walApplied} 帧`);
+      // 新版 KakaoTalk 运行时保护：全零/被锁的文件解密无意义，明确提示而非静默跳过
+      let isZeroed = buf.length >= 4096;
+      if (isZeroed) { for (let z = 0; z < 4096; z++) if (buf[z] !== 0) { isZeroed = false; break; } }
+      if (isZeroed) {
+        report('warn', `${edb.name} 当前为全零（KakaoTalk 运行时保护），已跳过——退出 KakaoTalk 后重试可解密`);
+        skipped++;
+        continue;
+      }
       let plain = null;
       for (const hit of hits) {
         const keyBytes = Buffer.from(hit.keyHex, 'hex');
@@ -767,11 +1013,15 @@ function decryptWithSqlCipherKeys(hits, usable, report) {
         skipped++;
       }
     } catch (e) {
-      report('warn', `${edb.name} 解密失败：${e.message}`);
+      // 排他锁（KakaoTalk 运行时保护）：给出可操作提示
+      const locked = /EBUSY|EPERM|EACCES/i.test(String(e.code || e.message));
+      report('warn', `${edb.name} 解密失败：${locked ? '文件被 KakaoTalk 独占锁定（请退出 KakaoTalk 后重试）' : e.message}`);
     }
   }
-  if (!files.length) return { ok: false, reason: '密钥命中探针但没有任何 EDB 解密成功' };
+  if (!files.length) return { ok: false, reason: '密钥命中探针但没有任何 EDB 解密成功（若 KakaoTalk 运行中文件可能为全零/被锁，请退出后重试）' };
   if (skipped) report('warn', `${skipped} 个 EDB 使用不同密钥或数据异常，已跳过（在 KakaoTalk 中打开对应聊天后重试可补全）`);
+  // 实际用到的 key 持久化（下次可跳过内存扫描直接解密）
+  addKeysToCache(hits.filter((h) => usedKeys.has(h.keyHex)));
   const first = hits.find((h) => usedKeys.has(h.keyHex)) || hits[0];
   return {
     ok: true,
@@ -781,34 +1031,10 @@ function decryptWithSqlCipherKeys(hits, usable, report) {
 }
 
 /**
- * SQLCipher 内存密钥恢复路线：dump KakaoTalk 进程私有内存 → hex 文本扫描 +
- * 二进制窗口扫描（AES 过滤 + HMAC 精验）→ 命中后解密全部（不依赖设备材料与 userId）。
- * 探针优先 TalkUserDB/chatListInfo/最大 chatLogs（登录后必然被加载，key 在内存概率最高）。
+ * 内存扫描核心：逐 PID dump（私有内存优先，失败回退全量）→ hex 文本扫描 → 二进制窗口扫描。
+ * 探针由调用方构建（buildProbeHeads：实时可读优先，全零/被锁回落探针缓存）。
  */
-async function trySqlCipherFromMemory(edbs, onProgress) {
-  const report = onProgress || (() => {});
-  const { running, pids } = await isKakaoTalkRunning();
-  if (!running) return { ok: false, reason: '内存密钥恢复需要 KakaoTalk 正在运行（请先启动并登录 KakaoTalk）' };
-  const usable = edbs.filter((e) => (e.size == null ? true : e.size >= 4096)); // SQLCipher 验证至少需要一整页
-  if (!usable.length) return { ok: false, reason: '没有足够大（≥4KB）的 EDB 文件可用于 SQLCipher 密钥验证' };
-  const desc = [...usable].sort((a, b) => (b.size || 0) - (a.size || 0));
-  const probes = pickSqlCipherProbes(desc, 3);
-  const probeInfo = [];
-  const probeHeads = probes.map((p) => {
-    let buf = Buffer.alloc(0);
-    try {
-      buf = readEdbHead(p, 8192);
-    } catch (e) {
-      probeInfo.push(`${p.name}:读取失败(${e.code || e.message})`);
-      return { name: p.name, buf };
-    }
-    if (buf.length >= 4096) probeInfo.push(`${p.name}:${buf.length}B`);
-    else probeInfo.push(`${p.name}:仅${buf.length}B(不足一页,可能被占用)`);
-    return { name: p.name, buf };
-  });
-  report('solve', `SQLCipher 探针：${probeInfo.join('、')}`);
-
-  const stats = { pidsFound: pids.length, pids: [], dumpMB: 0, dumpStats: null, probeInfo, hexWrapped: 0, hexBare: 0, binScanned: 0, binCandidates: 0, rounds: [] };
+async function scanMemoryForKeys(pids, probeHeads, probeInfo, report, stats) {
   for (const pid of pids.slice(0, 3)) {
     report('solve', `导出 KakaoTalk 进程内存（PID ${pid}，仅私有内存）…`);
     let dump = await dumpProcessMemory(pid, 300000, { privateOnly: true });
@@ -855,22 +1081,110 @@ async function trySqlCipherFromMemory(edbs, onProgress) {
         report('solve', '内存中未发现文本形态密钥，开始二进制窗口扫描（约 2-6 分钟，请耐心等待）…');
         hits = runBinaryRounds(dump.dumpPath, probeHeads, report, stats);
       }
-      if (hits.length) {
-        const dec = decryptWithSqlCipherKeys(hits, usable, report);
-        if (dec.ok) return dec;
-        report('warn', `${dec.reason}，继续扫描其它进程/轮次…`);
-      }
+      if (hits.length) return hits;
     } finally {
       try { fs.unlinkSync(dump.dumpPath); } catch { /* 清理失败不阻塞 */ }
     }
   }
+  return [];
+}
+
+/** 构建统计对象与最终失败 reason */
+function newScanStats(pidsFound, probeInfo) {
+  return { pidsFound, pids: [], dumpMB: 0, dumpStats: null, probeInfo, hexWrapped: 0, hexBare: 0, binScanned: 0, binCandidates: 0, rounds: [] };
+}
+function scanFailReason(stats) {
   const dstat = stats.dumpStats
     ? `，提交区 ${stats.dumpStats.commit}/命中 ${stats.dumpStats.matched}/bytes ${stats.dumpStats.bytes || 0}${stats.dumpStats.regions != null ? `/region ${stats.dumpStats.regions}` : ''}`
     : '';
-  return {
-    ok: false,
-    reason: `内存中未找到有效 SQLCipher 密钥（发现进程 ${stats.pidsFound} 个/成功导出 [${stats.pids.join(',') || '无'}]，导出内存 ${stats.dumpMB}MB${dstat}，探针[${stats.probeInfo.join(' ')}]，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`,
-  };
+  return `内存中未找到有效 SQLCipher 密钥（发现进程 ${stats.pidsFound} 个/成功导出 [${stats.pids.join(',') || '无'}]，导出内存 ${stats.dumpMB}MB${dstat}，探针[${stats.probeInfo.join(' ')}]，hex候选=${stats.hexWrapped}+${stats.hexBare}，二进制扫描窗口=${stats.binScanned}，过滤候选=${stats.binCandidates}，轮次=[${stats.rounds.join(' | ') || '无'}]）。请确认 KakaoTalk 已登录并打开过聊天列表/聊天窗口`;
+}
+
+/**
+ * SQLCipher 内存密钥恢复路线：dump KakaoTalk 进程私有内存 → hex 文本扫描 +
+ * 二进制窗口扫描（AES 过滤 + HMAC 精验）→ 命中后解密全部（不依赖设备材料与 userId）。
+ * 探针覆盖全部核心库（TalkUserDB/chatListInfo/全部 chatLogs），实时可读优先，
+ * 全零/被锁（新版 KakaoTalk 运行时保护）回落探针缓存。
+ */
+async function trySqlCipherFromMemory(edbs, onProgress) {
+  const report = onProgress || (() => {});
+  const { running, pids } = await isKakaoTalkRunning();
+  if (!running) return { ok: false, reason: '内存密钥恢复需要 KakaoTalk 正在运行（请先启动并登录 KakaoTalk）' };
+  const usable = edbs.filter((e) => (e.size == null ? true : e.size >= 4096)); // SQLCipher 验证至少需要一整页
+  if (!usable.length) return { ok: false, reason: '没有足够大（≥4KB）的 EDB 文件可用于 SQLCipher 密钥验证' };
+  // 探针：全部核心库，实时+缓存回落（替代原 pickSqlCipherProbes 3 个探针方案）
+  const { heads, states } = buildProbeHeads(usable);
+  const probeInfo = states.map((s) => {
+    const fromCache = heads.find((h) => h.name === s.name && h.fromCache);
+    if (fromCache) return `${s.name}:缓存探针`;
+    if (s.state === 'ok') return `${s.name}:实时`;
+    if (s.state === 'zeroed') return `${s.name}:全零(保护)`;
+    if (s.state === 'locked') return `${s.name}:被锁`;
+    return `${s.name}:${s.state}`;
+  });
+  report('solve', `SQLCipher 探针：${probeInfo.join('、')}`);
+  if (!heads.length) {
+    return { ok: false, reason: 'edb-protected', detail: '核心 EDB 当前全部为全零/被锁（新版 KakaoTalk 运行时保护），且无历史探针缓存可验证密钥。请先完全退出 KakaoTalk 让数据落盘，再运行本工具完成首次快照。' };
+  }
+  const stats = newScanStats(pids.length, probeInfo);
+  const hits = await scanMemoryForKeys(pids, heads, probeInfo, report, stats);
+  if (hits.length) {
+    const added = addKeysToCache(hits);
+    report('found', `命中 ${hits.length} 把密钥（新入库 ${added} 把），开始解密…`);
+    const dec = decryptWithSqlCipherKeys(hits, usable, report);
+    if (dec.ok) return dec;
+    report('warn', `${dec.reason}，继续扫描其它进程/轮次…`);
+  }
+  return { ok: false, reason: scanFailReason(stats) };
+}
+
+/**
+ * 两步流·仅取 key 不解密（KakaoTalk 运行态、文件被保护时使用）：
+ * dump 内存 → 探针验证 → 命中全部存入 key 缓存。之后退出 KakaoTalk 落盘再解密。
+ */
+async function collectKeysToCache(edbs, onProgress) {
+  const report = onProgress || (() => {});
+  const { running, pids } = await isKakaoTalkRunning();
+  if (!running) return { ok: false, reason: 'need-run-kakao', detail: '取密钥需要 KakaoTalk 正在运行且已登录（请启动 KakaoTalk，打开聊天列表和需要的聊天室）' };
+  const usable = (edbs || []).filter((e) => (e.size == null ? true : e.size >= 4096));
+  if (!usable.length) {
+    // 探针缓存兜底（文件清单为空也可能已有缓存）
+    const probes = loadProbeCache();
+    if (!Object.keys(probes).length) return { ok: false, reason: '没有可用的 EDB 文件或探针缓存' };
+  }
+  const { heads, states } = buildProbeHeads(usable);
+  const probeInfo = states.map((s) => `${s.name}:${heads.find((h) => h.name === s.name) ? (heads.find((h) => h.name === s.name).fromCache ? '缓存探针' : '实时') : s.state}`);
+  report('solve', `SQLCipher 探针：${probeInfo.join('、') || '无实时文件（全部使用探针缓存）'}`);
+  if (!heads.length) {
+    return { ok: false, reason: 'edb-protected', detail: '核心 EDB 当前全部为全零/被锁，且无历史探针缓存。请先完全退出 KakaoTalk 让数据落盘，运行本工具完成首次快照后再取密钥。' };
+  }
+  const stats = newScanStats(pids.length, probeInfo);
+  const hits = await scanMemoryForKeys(pids, heads, probeInfo, report, stats);
+  if (!hits.length) return { ok: false, reason: scanFailReason(stats) };
+  const added = addKeysToCache(hits);
+  report('found', `密钥已入库：命中 ${hits.length} 把（新增 ${added} 把，累计 ${loadKeyCache().length} 把）`);
+  return { ok: true, hits, keyCount: loadKeyCache().length, added };
+}
+
+/**
+ * 两步流·用缓存 key 解密（退出态文件可读，或解密快照）：无需内存扫描。
+ * key 集合 = key 缓存 ∪ 本次传入的 extraHits。
+ */
+async function decryptWithCachedKeys(edbs, onProgress, extraHits = []) {
+  const report = onProgress || (() => {});
+  const cached = loadKeyCache();
+  const seen = new Set();
+  const hits = [];
+  for (const h of [...cached, ...extraHits]) {
+    if (!h.keyHex || seen.has(h.keyHex)) continue;
+    seen.add(h.keyHex);
+    hits.push(h);
+  }
+  if (!hits.length) return { ok: false, reason: '没有已缓存的密钥（请先完成一次内存密钥提取）' };
+  const usable = (edbs || []).filter((e) => (e.size == null ? true : e.size >= 4096));
+  if (!usable.length) return { ok: false, reason: '没有可解密的 EDB 文件' };
+  report('solve', `使用 ${hits.length} 把已缓存密钥解密 ${usable.length} 个 EDB…`);
+  return decryptWithSqlCipherKeys(hits, usable, report);
 }
 
 /* ============ 汇总：Windows 自动发现 ============ */
@@ -921,6 +1235,17 @@ async function decryptAllEdbs(edbs, materials, userIdCandidates, onProgress) {
   const report = onProgress || (() => {});
   const sorted = [...edbs].filter((e) => (e.size == null ? true : e.size >= 16)).sort((a, b) => Math.max(a.size || 0, 1) - Math.max(b.size || 0, 1)); // 最小文件先试（求解最快）
   if (!sorted.length) return { ok: false, reason: 'EDB 文件均为空或过小' };
+  // 快速通道：有缓存 key（上次内存提取入库）且至少一个核心库实时可读时，直接解密，跳过材料/内存路线
+  const cachedKeys = loadKeyCache();
+  if (cachedKeys.length) {
+    const coreReadable = sorted.some((e) => isCoreEdbName(e.name) && probeEdbState(e).state === 'ok');
+    if (coreReadable) {
+      report('solve', `发现 ${cachedKeys.length} 把已缓存密钥，尝试直接解密…`);
+      const fast = decryptWithSqlCipherKeys(cachedKeys, sorted.filter((e) => (e.size == null ? true : e.size >= 4096)), report);
+      if (fast.ok) return fast;
+      report('warn', `缓存密钥未能解密（${fast.reason}），继续尝试材料/内存路线…`);
+    }
+  }
   if (!materials.length) {
     // 无设备材料时旧算法路线不可用，但新版 SQLCipher 内存密钥路线不依赖材料/userId
     report('solve', '注册表无设备材料，直接尝试 SQLCipher 内存密钥恢复…');
@@ -1005,4 +1330,19 @@ module.exports = {
   runBinaryRounds,
   decryptWithSqlCipherKeys,
   trySqlCipherFromMemory,
+  // 两步流（新版 KakaoTalk 反取证保护：运行时文件全零+锁，退出才落盘）
+  initCacheDir,
+  cacheDir,
+  probeEdbState,
+  buildProbeHeads,
+  isCoreEdbName,
+  winTwoStepStatus,
+  snapshotCoreEdbs,
+  loadSnapshotEdbs,
+  collectKeysToCache,
+  decryptWithCachedKeys,
+  loadKeyCache,
+  addKeysToCache,
+  readEdbWithWal,
+  replayWal,
 };

@@ -155,6 +155,8 @@ ipcMain.handle('discover', async () => {
 
 // ============ IPC：Windows EDB 自动发现与解密 ============
 const winKakao = require('./winKakao.cjs');
+// 两步流缓存目录（探针/key/快照）：userData 下持久化
+winKakao.initCacheDir(path.join(app.getPath('userData'), 'kakao-cache'));
 
 ipcMain.handle('win-discover', async () => {
   if (process.platform !== 'win32') {
@@ -162,6 +164,49 @@ ipcMain.handle('win-discover', async () => {
   }
   return winKakao.discoverWindows();
 });
+
+// 两步流状态检测（运行时文件全零/锁、key 缓存、快照）
+ipcMain.handle('win-two-step-status', async () => {
+  if (process.platform !== 'win32') throw new Error('仅 Windows 平台可用');
+  return winKakao.winTwoStepStatus();
+});
+
+// 退出态快照：复制核心库+WAL 到缓存目录
+ipcMain.handle('win-snapshot', async () => {
+  if (process.platform !== 'win32') throw new Error('仅 Windows 平台可用');
+  const edbInfo = winKakao.listEdbFiles();
+  return winKakao.snapshotCoreEdbs(edbInfo.edbs);
+});
+
+// 读取已有快照清单（解密用）
+ipcMain.handle('win-snapshot-edbs', async () => {
+  if (process.platform !== 'win32') throw new Error('仅 Windows 平台可用');
+  return winKakao.loadSnapshotEdbs();
+});
+
+// 两步流·仅取 key 存缓存（KakaoTalk 运行态）
+ipcMain.handle('win-collect-keys', async (e, opts) => {
+  if (process.platform !== 'win32') throw new Error('仅 Windows 平台可用');
+  const onProgress = makeWinProgress();
+  return winKakao.collectKeysToCache((opts && opts.edbs) || [], onProgress);
+});
+
+// 两步流·用缓存 key 解密（退出态实时文件或快照）
+ipcMain.handle('win-decrypt-cached', async (e, opts) => {
+  if (process.platform !== 'win32') throw new Error('仅 Windows 平台可用');
+  const onProgress = makeWinProgress();
+  return winKakao.decryptWithCachedKeys((opts && opts.edbs) || [], onProgress);
+});
+
+/** win-progress 事件发送器 */
+function makeWinProgress() {
+  return (stage, detail) => {
+    try {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (win && !win.isDestroyed()) win.webContents.send('win-progress', { stage, detail });
+    } catch { /* 忽略 */ }
+  };
+}
 
 ipcMain.handle('win-userid-from-memory', async () => {
   if (process.platform !== 'win32') {

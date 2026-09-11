@@ -19,6 +19,13 @@ contextBridge.exposeInMainWorld('kakaoApp', {
   /** Windows：求解参数并解密全部 EDB，返回明文 SQLite 字节数组 */
   winDecrypt: (opts) => ipcRenderer.invoke('win-decrypt', opts),
 
+  /** Windows 两步流：状态检测 / 快照 / 取密钥 / 缓存密钥解密 */
+  winTwoStepStatus: () => ipcRenderer.invoke('win-two-step-status'),
+  winSnapshot: () => ipcRenderer.invoke('win-snapshot'),
+  winSnapshotEdbs: () => ipcRenderer.invoke('win-snapshot-edbs'),
+  winCollectKeys: (opts) => ipcRenderer.invoke('win-collect-keys', opts),
+  winDecryptCached: (opts) => ipcRenderer.invoke('win-decrypt-cached', opts),
+
   /** Windows：解密进度事件回传 */
   onWinProgress: (cb) => {
     ipcRenderer.removeAllListeners('win-progress');
