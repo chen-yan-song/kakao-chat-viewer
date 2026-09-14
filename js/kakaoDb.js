@@ -224,6 +224,9 @@ export class KakaoDB {
     const report = (stage, detail) => onProgress && onProgress(stage, detail);
     const qid = (s) => '"' + String(s).replace(/"/g, '""') + '"';
     const qlit = (v) => (v == null ? 'NULL' : "'" + String(v).replace(/'/g, "''") + "'");
+    // SQL 数字字面量安全化：非数字/NaN 一律落 NULL，
+    // 否则 Number(非数字) 的 NaN 会被插值成标识符（实机报错 no such column: NaN）
+    const numOr = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? 'NULL' : String(Number(v)));
 
     report('wasm', '加载 SQLCipher WebAssembly 模块…');
     this.module = await getModule();
@@ -271,7 +274,10 @@ export class KakaoDB {
             const hit = cands.find((c) => cols.some((x) => x.toLowerCase() === c.toLowerCase()));
             return hit ? 's.' + qid(hit) : 'NULL';
           };
-          const chatId = edb.chatId ? Number(edb.chatId) : null;
+          const chatId =
+            edb.chatId != null && edb.chatId !== '' && Number.isFinite(Number(edb.chatId))
+              ? Number(edb.chatId)
+              : null;
           // 分批导入消息（防御病态数据/损坏页导致 wasm 全表扫描卡死；每批有界可观察）
           const MBATCH = 500;
           const MAX_MBATCH = 4000; // 硬上限 200 万条
@@ -286,7 +292,7 @@ export class KakaoDB {
             try {
               udb.exec(`
                 INSERT INTO NTChatMessage (chatId, authorId, message, type, sentAt)
-                SELECT ${chatId == null ? 'NULL' : Number(chatId)},
+                SELECT ${numOr(chatId)},
                        ${pick(['authorId', 'from', 'senderId', 'userId'])},
                        ${pick(['message', 'msg', 'content', 'text'])},
                        ${pick(['type', 'msgType', 'messageType'])},
@@ -320,10 +326,10 @@ export class KakaoDB {
             `)[0] || {};
             udb.exec(`
               INSERT INTO NTChatRoom (chatId, type, chatName, activeMembersCount, lastLogId, lastUpdatedAt)
-              VALUES (${Number(chatId)}, 0, ${qlit('聊天室 ' + chatId)},
-                      ${agg.members == null ? 'NULL' : Number(agg.members)},
-                      ${agg.lastLogId == null ? 'NULL' : Number(agg.lastLogId)},
-                      ${agg.lastAt == null ? 'NULL' : Number(agg.lastAt)})
+              VALUES (${numOr(chatId)}, 0, ${qlit('聊天室 ' + chatId)},
+                      ${numOr(agg.members)},
+                      ${numOr(agg.lastLogId)},
+                      ${numOr(agg.lastAt)})
               ON CONFLICT(chatId) DO UPDATE SET
                 lastLogId = COALESCE(excluded.lastLogId, lastLogId),
                 lastUpdatedAt = COALESCE(excluded.lastUpdatedAt, lastUpdatedAt),
@@ -376,8 +382,9 @@ export class KakaoDB {
           }
         }
 
-        // ---- 房间列表（chatListInfo.edb / TalkUserDB 内的 chatList）----
-        const listTable = srcTables.find((t) => /chatlist|chat_list/i.test(t));
+        // ---- 房间列表（chatListInfo.edb 的 chatRoomList / TalkUserDB 内的 chatList）----
+        // 实机表名为 chatRoomList（原正则只匹配 chatlist/chat_list 会漏掉，导致房间真名丢失）
+        const listTable = srcTables.find((t) => /chatlist|chat_list|chatroomlist/i.test(t));
         if (listTable) {
           const cols = udb.query(`PRAGMA src.table_info(${qid(listTable)})`).map((r) => r.name);
           const pick = (cands) => {
@@ -388,14 +395,23 @@ export class KakaoDB {
             cols.some((x) => x.toLowerCase() === c.toLowerCase())
           );
           if (idCol) {
+            // 实机房间名列是 chatRoomTitle；顺带导入成员数/最后更新/最后消息 ID 供列表排序展示
             udb.exec(`
-              INSERT INTO NTChatRoom (chatId, type, chatName)
-              SELECT s.${qid(idCol)}, 2, ${pick(['name', 'title', 'roomName'])}
+              INSERT INTO NTChatRoom (chatId, type, chatName, activeMembersCount, lastLogId, lastUpdatedAt, directChatMemberUserId)
+              SELECT s.${qid(idCol)}, 2, ${pick(['chatRoomTitle', 'name', 'title', 'roomName'])},
+                     ${pick(['activeMembersCount', 'membersCount'])},
+                     ${pick(['lastLogId'])},
+                     ${pick(['lastUpdatedAt', 'updatedAt'])},
+                     ${pick(['directChatMemberId', 'directChatMemberUserId'])}
               FROM src.${qid(listTable)} s
               WHERE s.${qid(idCol)} IS NOT NULL
               ON CONFLICT(chatId) DO UPDATE SET
                 chatName = COALESCE(excluded.chatName, chatName),
-                type = COALESCE(excluded.type, type)
+                type = COALESCE(excluded.type, type),
+                activeMembersCount = COALESCE(excluded.activeMembersCount, activeMembersCount),
+                lastLogId = COALESCE(excluded.lastLogId, lastLogId),
+                lastUpdatedAt = COALESCE(excluded.lastUpdatedAt, lastUpdatedAt),
+                directChatMemberUserId = COALESCE(excluded.directChatMemberUserId, directChatMemberUserId)
             `);
           }
         }
@@ -407,8 +423,10 @@ export class KakaoDB {
     userCount = Number(
       (udb.query('SELECT count(*) AS c FROM NTUser')[0] || { c: 0 }).c
     );
-    if (myId != null) {
-      udb.exec(`INSERT INTO NTChatContext (userId) VALUES (${Number(myId)})`);
+    // myId 在两步流里是占位串（sqlcipher-<key前缀>）而非数字 userId，非数字时跳过上下文行
+    const myIdLit = numOr(myId);
+    if (myIdLit !== 'NULL') {
+      udb.exec(`INSERT INTO NTChatContext (userId) VALUES (${myIdLit})`);
     }
     udb.close();
 
