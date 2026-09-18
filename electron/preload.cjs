@@ -38,6 +38,13 @@ contextBridge.exposeInMainWorld('kakaoApp', {
   /** 读取 KakaoTalk 容器内的数据库文件（主进程校验路径白名单） */
   readDbFile: (p) => ipcRenderer.invoke('read-db-file', p),
 
+  /**
+   * 解析消息媒体（图片/视频/语音/文件）
+   * opts: { chatId, logId, type, attachment, allowCdn? }
+   * 返回 { frames: [{ ok, tier, mime, base64, reason, name }] }
+   */
+  resolveMedia: (opts) => ipcRenderer.invoke('resolve-media', opts),
+
   /** 启动多线程 SHA-512 爆破；进度经 onBruteProgress 事件回传 */
   bruteStart: (opts) => ipcRenderer.invoke('brute-start', opts),
   bruteStop: () => ipcRenderer.invoke('brute-stop'),

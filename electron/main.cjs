@@ -261,6 +261,19 @@ ipcMain.handle('read-db-file', (_e, p) => {
   return copy.buffer;
 });
 
+// ============ IPC：图片 / 语音 / 视频媒体解析（本地 Pkv2 + 可选 CDN） ============
+const kakaoMedia = require('./media.cjs');
+ipcMain.handle('resolve-media', async (_e, opts) => {
+  if (process.platform !== 'darwin') {
+    return { frames: [{ ok: false, tier: 'stub', reason: 'media-macos-only' }] };
+  }
+  try {
+    return await kakaoMedia.resolveMedia(opts || {});
+  } catch (err) {
+    return { frames: [{ ok: false, tier: 'stub', reason: 'resolve-error:' + (err && err.message) }] };
+  }
+});
+
 ipcMain.handle('show-in-folder', (_e, p) => {
   if (typeof p === 'string' && fs.existsSync(p)) shell.showItemInFolder(p);
 });

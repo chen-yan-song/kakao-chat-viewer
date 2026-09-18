@@ -14,6 +14,7 @@ import {
   messageTypeInfo,
   serializeExport,
 } from './messageParser.js';
+import { isMediaMessage, loadMessageMedia, mediaFailLabel } from './media.js';
 import {
   parsePlist,
   extractUserIdInfo,
@@ -843,6 +844,67 @@ async function loadMore() {
 }
 
 /**
+ * 异步填充媒体区域（图片 / 视频 / 语音 / 文件）
+ */
+async function fillMediaHost(host, m) {
+  try {
+    const frames = await loadMessageMedia(m, { allowCdn: true });
+    if (!host.isConnected) return;
+    host.innerHTML = '';
+    let anyOk = false;
+    for (const f of frames) {
+      if (f.ok && f.objectUrl) {
+        anyOk = true;
+        const mime = f.mime || '';
+        if (mime.startsWith('image/')) {
+          const img = document.createElement('img');
+          img.className = 'msg-media-img';
+          img.src = f.objectUrl;
+          img.alt = f.name || '图片';
+          img.loading = 'lazy';
+          host.appendChild(img);
+        } else if (mime.startsWith('video/')) {
+          const video = document.createElement('video');
+          video.className = 'msg-media-video';
+          video.src = f.objectUrl;
+          video.controls = true;
+          video.preload = 'metadata';
+          host.appendChild(video);
+        } else if (mime.startsWith('audio/')) {
+          const audio = document.createElement('audio');
+          audio.className = 'msg-media-audio';
+          audio.src = f.objectUrl;
+          audio.controls = true;
+          audio.preload = 'metadata';
+          host.appendChild(audio);
+        } else {
+          const a = document.createElement('a');
+          a.className = 'msg-media-file';
+          a.href = f.objectUrl;
+          a.download = f.name || `file-${m.logId}`;
+          a.textContent = `下载 ${f.name || '附件'}（${f.tier}）`;
+          host.appendChild(a);
+        }
+        const tip = document.createElement('div');
+        tip.className = 'msg-media-meta';
+        tip.textContent = `来源：${f.tier}${f.reason && f.reason !== f.tier ? ' · ' + f.reason : ''}`;
+        host.appendChild(tip);
+      } else {
+        const tip = document.createElement('div');
+        tip.className = 'msg-media-fail';
+        tip.textContent = mediaFailLabel(f.reason);
+        host.appendChild(tip);
+      }
+    }
+    if (!anyOk && frames.length === 0) {
+      host.textContent = '无法获取媒体';
+    }
+  } catch (e) {
+    if (host.isConnected) host.textContent = '媒体加载失败：' + (e && e.message);
+  }
+}
+
+/**
  * 渲染消息列表
  * @param {{scrollBottom?: boolean, keepScroll?: boolean}} opts
  */
@@ -881,8 +943,9 @@ function renderMessages({ scrollBottom = false, keepScroll = false } = {}) {
     const row = document.createElement('div');
     const parsed = parseMessage(m.message, m.type, m.attachment);
     const mine = state.myId !== null && m.authorId === state.myId;
+    const isSystemRow = m.type === 0 || m.type === 1999;
 
-    if (m.type === 0) {
+    if (isSystemRow) {
       row.className = 'msg-row system';
       const bubble = document.createElement('div');
       bubble.className = 'msg-bubble';
@@ -907,7 +970,22 @@ function renderMessages({ scrollBottom = false, keepScroll = false } = {}) {
 
       const bubble = document.createElement('div');
       bubble.className = 'msg-bubble';
-      bubble.textContent = renderMessageText(parsed, m.type);
+      const label = renderMessageText(parsed, m.type);
+      if (label) {
+        const textNode = document.createElement('div');
+        textNode.className = 'msg-text';
+        textNode.textContent = label;
+        bubble.appendChild(textNode);
+      }
+
+      // 媒体消息：异步加载本地缓存 / CDN
+      if (isMediaMessage(m.type)) {
+        const mediaHost = document.createElement('div');
+        mediaHost.className = 'msg-media';
+        mediaHost.textContent = '媒体加载中…';
+        bubble.appendChild(mediaHost);
+        fillMediaHost(mediaHost, m);
+      }
 
       // 结构化 JSON / 二进制 / 附件摘要
       if (parsed.kind === 'json' && parsed.detail && !parsed.text) {
@@ -920,7 +998,7 @@ function renderMessages({ scrollBottom = false, keepScroll = false } = {}) {
         detail.className = 'msg-detail';
         detail.textContent = parsed.detail;
         bubble.appendChild(detail);
-      } else if (parsed.kind === 'attachment' && parsed.detail) {
+      } else if (parsed.kind === 'attachment' && parsed.detail && !isMediaMessage(m.type)) {
         // 贴纸/附件文件名（如 4449277.emot_002.webp）
         const detail = document.createElement('div');
         detail.className = 'msg-detail';

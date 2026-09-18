@@ -464,6 +464,47 @@ input:focus, select:focus {
   max-height: 90px;
   overflow-y: auto;
 }
+.msg-bubble .msg-text { white-space: pre-wrap; word-break: break-word; }
+.msg-media {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 280px;
+}
+.msg-media-img {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 10px;
+  display: block;
+  object-fit: contain;
+  background: #f0f0ee;
+  cursor: zoom-in;
+}
+.msg-media-video {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 10px;
+  background: #111;
+}
+.msg-media-audio { width: 100%; min-width: 200px; }
+.msg-media-file {
+  font-size: 13px;
+  color: #1a6fb5;
+  word-break: break-all;
+}
+.msg-media-meta {
+  font-size: 10.5px;
+  color: #aaa;
+}
+.msg-media-fail {
+  font-size: 12px;
+  color: #a67c00;
+  background: #fff8e1;
+  border-radius: 8px;
+  padding: 6px 8px;
+  line-height: 1.4;
+}
 .msg-time {
   font-size: 10.5px;
   color: #999;

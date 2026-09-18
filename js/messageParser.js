@@ -17,9 +17,75 @@ export const MESSAGE_TYPES = {
   5: { label: '表情', emoji: '😀' },
   6: { label: '文件', emoji: '📎' },
   7: { label: '位置', emoji: '📍' },
+  18: { label: '文件', emoji: '📎' },      // 通用附件（含部分音频）
   20: { label: '表情贴纸', emoji: '🎴' },   // 动态贴纸，内容在 attachment JSON
+  27: { label: '相册', emoji: '🖼' },       // 多图
   1999: { label: '系统记录', emoji: '⚙' }, // 无内容系统占位消息（如已读边界）
 };
+
+/** KakaoTalk feedType → 中文描述（尽力覆盖常见系统事件） */
+const FEED_TYPE_LABELS = {
+  1: '邀请入群',
+  2: '退出聊天室',
+  3: '被踢出',
+  4: '群主变更',
+  5: '群名变更',
+  6: '群头像变更',
+  7: '开麦/禁言相关',
+  11: '删除消息',
+  13: '加入开放聊天',
+  14: '离开开放聊天',
+};
+
+function personLabel(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  return obj.nickName || obj.nickname || obj.name || obj.userId || null;
+}
+
+function peopleList(arr) {
+  if (!Array.isArray(arr) || !arr.length) return '';
+  return arr.map(personLabel).filter(Boolean).join('、');
+}
+
+/**
+ * 解析系统 feed JSON（type 0），返回可读文案
+ * @returns {string|null}
+ */
+export function parseSystemFeed(raw) {
+  let obj = null;
+  if (raw && typeof raw === 'object' && !(raw instanceof Uint8Array)) {
+    obj = raw;
+  } else {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s.startsWith('{')) return null;
+    try {
+      obj = JSON.parse(s);
+    } catch {
+      return null;
+    }
+  }
+  if (!obj || typeof obj !== 'object') return null;
+  if (obj.feedType == null && !obj.inviter && !obj.member && !obj.leaver && !obj.members) {
+    return null;
+  }
+
+  const ft = Number(obj.feedType);
+  const label = FEED_TYPE_LABELS[ft] || (Number.isFinite(ft) ? `系统事件(${ft})` : '系统事件');
+  const inviter = personLabel(obj.inviter);
+  const member = personLabel(obj.member) || personLabel(obj.leaver);
+  const members = peopleList(obj.members);
+  const content = typeof obj.content === 'string' ? obj.content.trim() : '';
+
+  const parts = [label];
+  if (inviter) parts.push(`发起人：${inviter}`);
+  if (member) parts.push(`对象：${member}`);
+  if (members) parts.push(`成员：${members}`);
+  if (content) parts.push(content);
+  if (typeof obj.chatName === 'string' && obj.chatName.trim()) {
+    parts.push(`群名：${obj.chatName.trim()}`);
+  }
+  return parts.join(' · ');
+}
 
 export function messageTypeInfo(type) {
   return MESSAGE_TYPES[type] || { label: `类型${type}`, emoji: '📄' };
@@ -107,6 +173,16 @@ const JSON_TEXT_FIELDS = ['text', 'message', 'content', 'msg', 'body'];
  * @returns {{text: string, kind: 'text'|'json'|'binary'|'empty'|'nontext'|'attachment', detail: string|null}}
  */
 export function parseMessage(raw, type, attachment = null) {
+  // 系统 feed（type 0）：优先解析 feedType JSON
+  if (Number(type) === 0) {
+    const feed = parseSystemFeed(raw);
+    if (feed) return { text: feed, kind: 'system', detail: null };
+  }
+  // 系统记录占位（type 1999）：通常无正文
+  if (Number(type) === 1999) {
+    return { text: '', kind: 'system', detail: '系统占位（如已读边界），无正文内容' };
+  }
+
   // message 为空但有 attachment（贴纸/图片等）：从 attachment JSON 提取描述
   const hasAttachment = typeof attachment === 'string' && attachment.trim().length > 0;
   if (raw === null || raw === undefined || raw === '') {
@@ -193,6 +269,11 @@ function tryParseJsonText(s) {
 /** 将消息解析结果渲染为聊天框展示文本 */
 export function renderMessageText(parsed, type) {
   const info = messageTypeInfo(type);
+  if (Number(type) === 0 || Number(type) === 1999) {
+    if (parsed.text) return parsed.text;
+    if (parsed.detail) return `[${info.label}] ${parsed.detail}`;
+    return `[${info.label}]`;
+  }
   if (parsed.text) {
     // 贴纸类：正文带描述时加类型前缀，一眼区分贴纸与普通文本
     if (type === 20 && parsed.kind === 'attachment') return `[${info.label}] ${parsed.text}`;

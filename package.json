@@ -1,6 +1,6 @@
 {
   "name": "kakao-chat-viewer",
-  "version": "2.1.6",
+  "version": "2.1.7",
   "description": "KakaoTalk macOS 聊天记录查看与导出（Mac App，全自动解密）",
   "type": "module",
   "private": true,
@@ -8,6 +8,9 @@
   "scripts": {
     "start": "electron .",
     "serve": "python3 serve.py",
+    "test": "npm run test:boundary",
+    "test:boundary": "node electron/media.boundary.test.cjs && node js/messageParser.boundary.test.mjs",
+    "test:media": "node electron/media.selftest.cjs && node electron/media.boundary.test.cjs",
     "dist": "electron-builder --mac",
     "dist:win": "electron-builder --win",
     "dist:dir": "electron-builder --mac --dir"
@@ -23,16 +26,21 @@
       "js/**/*",
       "vendor/**/*",
       "css/**/*",
-      "index.html"
+      "index.html",
+      "!electron/**/*.test.cjs",
+      "!electron/**/*.selftest.cjs",
+      "!js/**/*.test.mjs",
+      "!js/**/*.boundary.test.mjs"
     ],
     "mac": {
       "target": [
         "dmg",
-        "dir"
+        "zip"
       ],
       "category": "public.app-category.utilities",
       "icon": "build/icon.icns",
-      "identity": null
+      "identity": null,
+      "artifactName": "KakaoChat-Viewer-${version}-${arch}.${ext}"
     },
     "win": {
       "target": [
